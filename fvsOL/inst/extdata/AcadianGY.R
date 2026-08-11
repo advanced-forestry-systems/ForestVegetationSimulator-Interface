@@ -1,5 +1,6 @@
 # $Id: AcadianGY.R 3968 2022-04-28 10:36:05Z nickcrookston $
 ################################################################################
+# v12.7.1.r  (coupled two-segment self-thinning + density-released ingrowth)
 # v12.5.0.r 
 #
 # Acadian Variant of the Forest Vegetation Simulator (FVS-ACD)                                                                                            #
@@ -13,11 +14,153 @@
 library(dplyr) # needed arrange, mutate, left_join, tibble, select, group_by, summarise, ungroup, case_when, all_of
 library(purrr) # needed for pmap_*
 
-AcadianVersionTag = "AcadianV12.5.0"
+AcadianVersionTag = "AcadianV12.11"
+
+# ---------------------------------------------------------------------------
+# 12.11 (maturity-gradient long-horizon volume correction; three gated levers, default OFF
+#        => byte-identical to 12.10.2, which is itself byte-identical to the frozen 12.10.1
+#        at default ops. Built off _scripts/AcadianGY_12.10.2.r. Corrects the sign-flipping
+#        long-horizon volume bias isolated in 20260718_longinterval_volume_diagnosis.md:
+#        under-prediction in developing stands, over-prediction in mature stands, the net of
+#        three separate systematic component errors. Framed on Weiskittel et al. (2011) Ch 10
+#        (linking resolutions): run stand-level growth/mortality/ingrowth equations and
+#        constrain or disaggregate the tree-level predictions to them, rather than raw
+#        per-tree multipliers. Every lever is gated and OFF by default.)
+#
+#   LEVER 1  recruitment (highest volume leverage). Predicted ingrowth runs 3 to 42 pct of
+#     observed; the BA-anchored ingrowth ratio is roughly density-flat at about 2.5. The flat
+#     correction needs NO engine edit: ops$ingrowth.mult (already read, default 1) does it.
+#     v12.11 adds ONE gated refinement, an RD taper that protects mature closed stands (Baxter
+#     own ratio only 1.31) from the flat 2.5x: ops$use.ingrowth.rdtaper (default OFF). When ON,
+#     ingrowth.mult is replaced per plot by m(RD) = t0 + t1*(1 - logistic(tk*(RD - tc))),
+#     defaults t0=1.4, t1=1.4, tk=12, tc=0.80 => about 2.8 in open stands, tapering to about
+#     1.4 as RD -> 1. Double-count guard: this lever owns ONLY the BA/count ingrowth deficit;
+#     the recruit-undergrowth diameter growth belongs to lever 3, do not add it twice.
+#
+#   LEVER 2  mortality (second volume mover). SILC-calibrated self-thinning over-removes at
+#     MANAGED high-density structures (CTRN predicted 4.6x observed, NB 2.5x) while natural
+#     stands are removed about right (Baxter, Maine FIA obs/pred ~1.07). A pure density scalar
+#     is wrong; the correction is MANAGEMENT GATED. ops$mort.dens.scale (default OFF). When ON,
+#     the self-thinning removal fraction sdm_mfrac is attenuated for managed/thinned stands by
+#     f(RD) = fmin + (1-fmin)*exp(-k*max(RD - RD0, 0)), RD = SDI/1200 (fit basis), natural
+#     stands f = 1. Fitted (fit_mort_v1211.R): fmin=0.13, k=12.4, RD0=0.38. Managed status from
+#     ops$stand.managed (logical) if given, else inferred from planted/PCT mgmt.class or an
+#     active thinning. Preserves Reineke and the plateau: natural f=1, floor fmin attenuates
+#     but never disables, the separate sdm_keepc ceiling holding RD <= sdm_max is untouched.
+#
+#   LEVER 3  survivor diameter increment (mature-end fix). Survivor diameter growth is too high,
+#     concentrated in large trees (20 to 40 cm) of mature high-QMD stands; it is the sole driver
+#     of the Baxter +9 pct (survivor BA obs/pred 0.634) and is about right at the developing
+#     Maine FIA end. Two gated forms, both size AND maturity dependent, both OFF by default:
+#       3a DIRECT (ops$use.ddbh.rein): per-tree m = max(mfloor, 1 - r*G(dbh)*H(QMD)),
+#          G(dbh)=logistic((dbh-d0)/ds), H(QMD)=logistic((QMD-q0)/qs); defaults r=0.90,
+#          mfloor=0.15, d0=25, ds=6, q0=18, qs=3. Baxter survivor BA 4.15 -> 2.63, Maine FIA
+#          x0.966. Applied with the other ddbh modifiers, before the stand BA constraint.
+#       3b STAND CONSTRAINT (ops$use.ddbh.standcon), the Ch 10 method: the engine ALREADY
+#          disaggregates a stand BA-increment target (plot_ba_incr) proportionally to trees
+#          (dba.tree.plot = dba * dba.tree / dba.tree.sum) and back-solves ddbh, but only above
+#          ba.plot > 0.6-0.8*k, so mature stands below that BA (Baxter ~29 m2/ha < 0.6*64.46)
+#          escape the constraint and over-accrete. This lever lowers the activation thresholds
+#          via ops$ddbh.standcon.lo / .hi (defaults 0.6 / 0.8 reproduce 12.10.2 exactly). Set
+#          lower (e.g. 0.35 / 0.45) to bind the proportional-increment constraint in mature
+#          stands; the overshoot condition (dba.tree.sum > dba) makes it self-target by maturity.
+#     Use 3a OR 3b, not both at once (they would double-correct the same survivor BA).
+#     3b re-tune: ops$ddbh.standcon.qmin (default 0) adds a stand QMD floor so the lowered thresholds
+#     bind only in mature high-QMD stands; below the floor the effective thresholds revert to 0.6/0.8,
+#     sparing developing low-QMD stands whose growth an un-gated 3b was found to suppress (fig17).
+#
+#   LEVER 4  hardwood height, form and risk conditioned (ops$use.dht.hw.mod, default OFF). The base
+#     height increment dht() has no form/risk term; poor-form/high-risk hardwoods grow shorter than
+#     the model projects, and height drives NSVB volume, so this is the primary developing-end,
+#     hardwood-rich fix. dht_hw_mod() mirrors Castle ddbh_hw_mod (six species RO/SM/YB/RM/PB/QA, AB
+#     excluded; form A vs B, risk LR vs HR), multiplicative, normalized to 1 at reference so gate-off
+#     and reference trees are unchanged. Species-specific risk coefficients fit from FIA ME GRM
+#     remeasurement (ANN_HT_GROWTH); form coefficient a placeholder (ops$dht.hw.gamma.form) pending
+#     field NHRI form data. Separate flag from ops$use.hw.mod so it ships and tests independently.
+#     Interaction to revalidate when ON: it shifts htdbh feeding hw_sawfrac_smith.R (sawlog fraction).
+# ---------------------------------------------------------------------------
+# 12.10.1 (robust re-fit of the management modifiers; gated, default OFF => identical to 12.9.x)
+#   Resolves the red-team weakness in 12.10.0: the planted and PCT multipliers pinned to the 1.6 guard
+#   clamp because they were the ratio of class-mean NET increments, and the mean predicted-untreated NET
+#   increment is near zero on these mature managed stands (planted 1.06, PCT 0.26 m2/ha) because self-
+#   thinning declines cancel gross growth across the class (about 25 pct of stands have negative predicted-
+#   untreated net increment). That made the ratio blow up (planted 5.2, PCT 10.2) and pin to the clamp,
+#   so the effective modifier was a capped constant that could not vary with data.
+#   Fix: the direct effect is now fitted as a robust ADDITIVE direct-effect release (10 pct trimmed mean
+#   of per-stand observed-minus-predicted-untreated increment, per metric, per class), which is clamp-free
+#   and well identified. Fitted BA release planted +3.8 m2/ha, PCT +2.4 m2/ha (with proportional releases
+#   in the other metrics). Fold coefficients now MOVE (planted BA release [3.57,4.14], PCT [2.28,2.57])
+#   instead of pinning at 1.6. Expressed as an equivalent net-increment multiplier the effect is about 3.0
+#   (planted) and 2.3 (PCT), i.e. ABOVE the old clamp, confirming the clamp was suppressing a genuine large
+#   effect (which is why clamped 12.10.0 still under-predicted planted, -4.4 pct total volume, -15.4 pct BA).
+#   Out of sample the re-fit holds: leave-one-installation-out managed mean abs bias 1.4, leave-one-province
+#   1.5, 200-fold managed split-half 5.6 (OSM 8.3), beating OSM in 76 pct of splits; PCT now transfers
+#   across the NB<->QC province block (LOPO PCT 4.1 vs OSM 3.7, up from 7.3 in 12.10.0) and the PCT BA
+#   residual is resolved (in-domain PCT BA +0.3 vs OSM -5.4). Unmanaged and growing stands untouched.
+#   Engine form: the direct effect is carried as a gated sustained (planted, Type 2) / decaying (PCT,
+#   Type 1) diameter-growth multiplier whose amplitude comes from the robust fit; the hard 0.7-1.6 clamp
+#   is removed. A 160-yr smoke test confirms self-thinning caps the long-horizon plateau at every amplitude
+#   tested (sd of BA over last 20 yr about 0.21, flat; ceiling rises smoothly, no runaway), so the operational
+#   planted amplitude is set to 2.0 (ceiling about +20 pct, a productive planted conifer stand) with self-
+#   thinning bounding projection. Mortality is still NOT given a multiplicative modifier (distorts the
+#   logistic asymptote, Ch 11); the management-as-predictor refit is the v13 item.
+#     planted (Type 2): ddbh * mgmt.planted.mult                         [sustained, mgmt.planted.mult=2.0]
+#     PCT     (Type 1): ddbh * (1 + mgmt.pct.a*exp(-mgmt.pct.b*tst))     [decays; a=1.0, b=0.03/yr]
+#   Gated by ops$use.mgmt.mod (default FALSE) => gate-off is byte-identical to 12.9.x (max dbh diff 0.0e+00
+#   verified), legacy flags reproduce 12.5.0. Built by the multi-step method (Wang 1990) per Weiskittel,
+#   Hann, Kershaw and Vanclay (2011) Forest Growth and Yield Modeling, Ch 11; the base untreated equations
+#   carry the INDIRECT structural effect, so the modifier isolates only the DIRECT effect.
+# ---------------------------------------------------------------------------
+# 12.10.0 (strategic management modifiers; gated, default OFF => identical to 12.9.x) [superseded by 12.10.1]
+#   Original planted/PCT direct-effect modifiers fit as the approach-3 fixed-untreated ratio of class-mean
+#   increments, guard-clamped to 0.7-1.6; both classes pinned to the 1.6 ceiling (see 12.10.1 note above).
+# ---------------------------------------------------------------------------
+# #126b in-source size-dependent mortality correction (opt-in via ops$use.mortcal).
+# Ported from AcadianGY_12.3.9.r into the rewritten 12.5.0 codebase.
+# Observed / AcadianGY 5-yr survival ratio by post-growth DBH class (inches),
+# from the Maine FIA v10 survival-by-size diagnostic. CONDITION-SPECIFIC: do not
+# enable outside FIA-like Maine conditions (over-corrects Canadian CFI, #128).
+# Partial fix (#127): roughly halves BA over-projection, does not close it.
+# ---------------------------------------------------------------------------
+.mortcal_surv_ratio <- function(dbh_in) {
+  ifelse(dbh_in < 5,  0.914,
+  ifelse(dbh_in < 10, 0.973,
+  ifelse(dbh_in < 15, 0.941,
+  ifelse(dbh_in < 20, 0.899, 0.846))))
+}
 
 ##############################
 #### major update summary ####
+
+# 12.7.0 (integrated operational: + fitted ESI dominant-height anchor, gated ops$use.esi.domht)
+#   - Htop(age)=A*(1-exp(-k*age))^p, k=0.0039 p=0.726 base 50; ESI sets A via base-age value.
+#   - operational config: Kuehne 2022 DG, ESI site driver + this anchor, ev ingrowth, sdimort;
+#     mort.cut.scale and ddbh.sizeform gated off by default.
+# 12.6.5 (interim size-form ddbh modifier on the Kuehne 2022 base; gated)
+#   - ops$use.ddbh.sizeform applies cf(dbh)=clamp(a+b*dbh,0.8,1.3) to ddbh.
+#     Default off (a=1,b=0 reproduce 12.6.4). Addresses Kuehne size-form attenuation.
+# 12.6.4 (regional stand-mortality cut scale; structural fix for the Maine mortality deficit)
+#   - ops$mort.cut.scale scales the stand-mortality probability cut (default 1 = 12.6.1;
+#     <1 lowers the cut so below-threshold stands receive mortality). Gated, region-set by driver.
+# 12.6.1 (ingrowth refinement; volume and value validated across NB/NS/ME)
+#   - make_ops() default ingrowth = expected-value recruitment (ingrowth.thrshld = 0,
+#     use.ingrowth = TRUE): the statistically correct annualized hurdle-model mean,
+#     E[ingrowth] = P(occur) * E[count], replacing the 0.95 occurrence gate that
+#     suppressed recruitment on most plot-years and drove the stem-count deficit.
+#   - ingrowth.mult retained as a fine calibration knob (default 1.0).
+#   - to reproduce 12.6.0/12.5.0 ingrowth: set ingrowth.thrshld = 0.95.
+# 12.6.0 (site-driver + self-thinning refinements; gated, default-on)
+#   - make_stand() accepts esi=; ESI flows into the csi slot (site.source logged)
+#   - calc_sdi_max() site (/csi) term gated by ops$sdimax.site.term (default drop, recentred +15.6)
+#   - new SDImax-ceiling self-thinning mortality (ops$use.sdimort, onset/beta/max); only binds near frontier
+#   - MORTCAL retained (ops$use.mortcal) but default OFF; SDImort is the principled self-thinning lever
+#   - all refinements gated: use.sdimort=FALSE, sdimax.site.term=TRUE, use.mortcal=FALSE, no esi => 12.5.0
 ####
+
+# 12.9.0
+  # v12.9: region-specific SDImax multiplier hook (ops$sdimax.region.mult), gated,
+  # defaults to 12.7.1 exactly when unset. Regional and composition-aware mortality refit,
+  # region term only (composition already in the Weiskittel-Kuehne 2019 sdimax equation).
 
 # 12.5.0
   # significant rewrite of codebase   
@@ -819,11 +962,40 @@ ddbh_thin_mod = function(sp, ba.perc.rmv, ba.pre.thin, qmd.ratio, year.thin, yea
                            year.thin <= year,
                          round(1 + (exp(y0 + (y1 / ((100 * ba.perc.rmv * qmd.ratio) + 0.01))) * y2^tst * tst^y3), 5),
                          1.0)
-  
+
   ddbh.thin.mod
 }
 
-# Chen, C; Weiskittel, AR; Bataineh, M; MacLean, DA. 2018. Refining the Forest 
+# Strategic management modifier (direct effect), per Weiskittel, Hann, Kershaw and Vanclay 2011, Ch 11.
+# Planted origin = Type 2 (sustained productivity change), modeled as a sustained diameter-growth
+# multiplier. Precommercial thinning (PCT) = Type 1 (transient release/shock), modeled as a
+# multiplicative diameter-growth boost that DECAYS with time since treatment. The base untreated
+# equations already carry the indirect structural effect; this isolates the direct effect only.
+# 12.10.1: amplitudes come from a robust ADDITIVE direct-effect release (planted +3.8, PCT +2.4 m2/ha BA;
+# see version note), replacing the 12.10.0 clamped net-increment ratio that pinned to 1.6. The hard clamp
+# is removed; the long-horizon plateau is bounded by self-thinning (verified by a 160-yr smoke test).
+
+#' Calculate direct-effect management diameter-growth modifier
+#'
+#' @param mgmt.class Character: stand management class; 'PLANTED', 'PCT', or 'NONE'/NA
+#' @param tst Numeric: years since the PCT treatment (used for the Type 1 decay); NA => nominal 10
+#' @param planted.mult Numeric: sustained Type 2 planted multiplier (default 2.0, robust re-fit)
+#' @param pct.a Numeric: PCT Type 1 boost amplitude (default 1.0, robust re-fit)
+#' @param pct.b Numeric: PCT Type 1 decay rate per year (default 0.03)
+#' @return Numeric: multiplicative modifier on diameter growth (1.0 = no effect)
+mgmt_dg_mod = function(mgmt.class, tst = NA_real_, planted.mult = 2.0, pct.a = 1.0, pct.b = 0.03) {
+  if (is.na(mgmt.class)) return(1)
+  cls = toupper(as.character(mgmt.class))
+  if (cls == 'PLANTED') {
+    return(planted.mult)                                   # Type 2, sustained
+  } else if (cls == 'PCT') {
+    ts = if (!is.na(tst)) max(tst, 0) else 10              # nominal 10 yr when timing unknown
+    return(round(1 + pct.a * exp(-pct.b * ts), 5))         # Type 1, transient, decaying
+  }
+  return(1)
+}
+
+# Chen, C; Weiskittel, AR; Bataineh, M; MacLean, DA. 2018. Refining the Forest
 # Vegetation Simulator for projecting the effects of spruce budworm defoliation 
 # in the Acadian Region of North America. Forestry Chronicles 94: 240-253.
 
@@ -996,7 +1168,23 @@ calc_ddbh = function(tree.data, plot.data, csi = stand$csi, region = stand$regio
     tree = tree %>%
       dplyr::mutate(ddbh.thin.mod = 1)
   }
-  
+
+  # Strategic management modifier (planted Type 2 / PCT Type 1, direct effect). Gated, default OFF.
+  if (isTRUE(ops$use.mgmt.mod) &&
+      !is.null(ops$mgmt.class) && !is.na(ops$mgmt.class) &&
+      toupper(as.character(ops$mgmt.class)) %in% c('PLANTED','PCT')) {
+    .mgmt.class = ops$mgmt.class
+    .mgmt.tst   = if (!is.null(ops$mgmt.tst)) ops$mgmt.tst else NA_real_
+    .plmult     = if (!is.null(ops$mgmt.planted.mult)) ops$mgmt.planted.mult else 2.0
+    .pcta       = if (!is.null(ops$mgmt.pct.a)) ops$mgmt.pct.a else 1.0
+    .pctb       = if (!is.null(ops$mgmt.pct.b)) ops$mgmt.pct.b else 0.03
+    tree = tree %>%
+      dplyr::mutate(ddbh.mgmt.mod = mgmt_dg_mod(.mgmt.class, .mgmt.tst, .plmult, .pcta, .pctb))
+  } else {
+    tree = tree %>%
+      dplyr::mutate(ddbh.mgmt.mod = 1)
+  }
+
   # Spruce budworm modifier
   if(use.sbw.mod == TRUE & 
       region %in% c('ME', 'NB') &
@@ -1036,9 +1224,32 @@ calc_ddbh = function(tree.data, plot.data, csi = stand$csi, region = stand$regio
       dplyr::mutate(ddbh.sbw.mod = 1)
   }
   
+  # Lever 3a (v12.11): survivor large-tree diameter rein, size AND maturity dependent.
+  # Gated ops$use.ddbh.rein (default OFF => ddbh.rein.mod = 1, product unchanged, byte-identical
+  # to 12.10.2). m = max(mfloor, 1 - r*G(dbh)*H(QMD)) with G,H logistic in tree DBH and stand
+  # QMD, reins the over-accreting large trees of mature high-QMD stands (Baxter +9 pct) while
+  # leaving developing (low QMD) stands and small trees essentially untouched. Interim direct
+  # form of the Ch 10 correction; use 3a OR the 3b stand constraint, not both.
+  if (isTRUE(ops$use.ddbh.rein)) {
+    .rn_r  = tryCatch(if (!is.null(ops$ddbh.rein.r)     && !is.na(ops$ddbh.rein.r))     ops$ddbh.rein.r     else 0.90, error=function(e) 0.90)
+    .rn_fl = tryCatch(if (!is.null(ops$ddbh.rein.floor) && !is.na(ops$ddbh.rein.floor)) ops$ddbh.rein.floor else 0.15, error=function(e) 0.15)
+    .rn_d0 = tryCatch(if (!is.null(ops$ddbh.rein.d0)    && !is.na(ops$ddbh.rein.d0))    ops$ddbh.rein.d0    else 25,   error=function(e) 25)
+    .rn_ds = tryCatch(if (!is.null(ops$ddbh.rein.ds)    && !is.na(ops$ddbh.rein.ds))    ops$ddbh.rein.ds    else 6,    error=function(e) 6)
+    .rn_q0 = tryCatch(if (!is.null(ops$ddbh.rein.q0)    && !is.na(ops$ddbh.rein.q0))    ops$ddbh.rein.q0    else 18,   error=function(e) 18)
+    .rn_qs = tryCatch(if (!is.null(ops$ddbh.rein.qs)    && !is.na(ops$ddbh.rein.qs))    ops$ddbh.rein.qs    else 3,    error=function(e) 3)
+    tree = tree %>%
+      dplyr::left_join(dplyr::transmute(plot.data, plot, .rein_qmd = qmd), by = 'plot') %>%
+      dplyr::mutate(ddbh.rein.mod = pmax(.rn_fl, 1 - .rn_r *
+                       (1 / (1 + exp(-(dbh - .rn_d0) / .rn_ds))) *
+                       (1 / (1 + exp(-(dplyr::coalesce(.rein_qmd, 0) - .rn_q0) / .rn_qs))))) %>%
+      dplyr::select(-.rein_qmd)
+  } else {
+    tree = tree %>% dplyr::mutate(ddbh.rein.mod = 1)
+  }
+
   # Apply modifiers
   tree = tree %>%
-    dplyr::mutate(ddbh = ddbh * ddbh.thin.mod * ddbh.sbw.mod * ddbh.form.risk.mod * ddbh.mult)
+    dplyr::mutate(ddbh = ddbh * ddbh.thin.mod * ddbh.sbw.mod * ddbh.mgmt.mod * ddbh.form.risk.mod * ddbh.mult * ddbh.rein.mod * (if (isTRUE(ops$use.ddbh.sizeform)) pmin(1.3, pmax(0.8, (if (!is.null(ops$ddbh.sf.a)) ops$ddbh.sf.a else 1) + (if (!is.null(ops$ddbh.sf.b)) ops$ddbh.sf.b else 0) * dbh)) else 1))
   
   # plot basal area constraint constant
     k = 64.45952
@@ -1048,23 +1259,44 @@ calc_ddbh = function(tree.data, plot.data, csi = stand$csi, region = stand$regio
     dplyr::mutate(dba = plot_ba_incr(rd = rd.mod, csi = csi, 
                                      ba.perc.hw = ba.perc.hw, ba.plot = ba.plot))
   
-  # Apply plot basal area constraint
-    # above 0.8*k - proportion of plot ba only
-    # above 0.6*k - average of predicted BA increment and proportion of plot ba
+  # Apply plot basal area constraint (Weiskittel et al. 2011 Ch 10 proportional-increment
+  # disaggregation: allocate the stand BA-increment target dba to trees in proportion to their
+  # predicted increment, then back-solve ddbh).
+    # above hi*k - proportion of plot ba only
+    # above lo*k - average of predicted BA increment and proportion of plot ba
+  # Lever 3b (v12.11): ops$use.ddbh.standcon lowers the activation thresholds so the constraint
+  # binds in mature stands (Baxter ~29 m2/ha sits below the default 0.6*k=38.7 and escapes it,
+  # hence the mature-end survivor over-accretion). Defaults hi=0.8, lo=0.6 reproduce 12.10.2
+  # byte-for-byte when the lever is OFF (the literals are unchanged doubles).
+  # 3B re-tune (v12.11): the lowered activation thresholds bind only in MATURE stands, gated by a
+  # stand QMD floor ops$ddbh.standcon.qmin (default 0 = no maturity gate, reproduces the un-gated 3B).
+  # fig17 showed that lowering the thresholds globally suppressed developing low-QMD FIA growth (the
+  # me_fia_l regression); a QMD floor keeps developing stands on the default 0.6/0.8 thresholds while
+  # binding the constraint on mature high-QMD stands (Baxter). Below the floor the effective thresholds
+  # revert to 0.8/0.6, so a developing stand is untouched even with the lever ON.
+  .sc_on   = isTRUE(ops$use.ddbh.standcon)
+  .sc_hi   = if (.sc_on && !is.null(ops$ddbh.standcon.hi) && !is.na(ops$ddbh.standcon.hi)) ops$ddbh.standcon.hi else 0.8
+  .sc_lo   = if (.sc_on && !is.null(ops$ddbh.standcon.lo) && !is.na(ops$ddbh.standcon.lo)) ops$ddbh.standcon.lo else 0.6
+  .sc_qmin = if (.sc_on && !is.null(ops$ddbh.standcon.qmin) && !is.na(ops$ddbh.standcon.qmin)) ops$ddbh.standcon.qmin else 0
   tree = tree %>%
     dplyr::mutate(dba.tree = 0.00007854 * expf * ((ddbh + dbh)^2 - dbh^2)) %>%
     dplyr::group_by(plot) %>%
     dplyr::mutate(dba.tree.sum = sum(dba.tree, na.rm = TRUE)) %>%
     dplyr::ungroup() %>%
-    dplyr::left_join(plot.smry.ba %>% 
-                       dplyr::select(plot, ba.plot, dba), 
+    dplyr::left_join(plot.smry.ba %>%
+                       dplyr::select(plot, ba.plot, dba),
                      by = 'plot') %>%
-    dplyr::mutate(dba.tree.plot = dba * (dba.tree / dba.tree.sum),
-                  ddbh = dplyr::case_when(ba.plot > (k*0.8) & dba.tree.sum > dba ~
-                                            sqrt((dba.tree.plot + ba) / 0.00007854 / expf) - dbh, 
-                                          ba.plot > (k*0.6) & dba.tree.sum > dba ~
-                                            sqrt(((dba.tree.plot+dba.tree)/2 + ba) / 0.00007854 / expf) - dbh, 
-                                          TRUE ~ddbh)) 
+    dplyr::left_join(dplyr::transmute(plot.data, plot, .sc_qmd = qmd), by = 'plot') %>%
+    dplyr::mutate(.sc_mat = dplyr::coalesce(.sc_qmd, 0) >= .sc_qmin,
+                  .eff_hi = ifelse(.sc_mat, .sc_hi, 0.8),
+                  .eff_lo = ifelse(.sc_mat, .sc_lo, 0.6),
+                  dba.tree.plot = dba * (dba.tree / dba.tree.sum),
+                  ddbh = dplyr::case_when(ba.plot > (k*.eff_hi) & dba.tree.sum > dba ~
+                                            sqrt((dba.tree.plot + ba) / 0.00007854 / expf) - dbh,
+                                          ba.plot > (k*.eff_lo) & dba.tree.sum > dba ~
+                                            sqrt(((dba.tree.plot+dba.tree)/2 + ba) / 0.00007854 / expf) - dbh,
+                                          TRUE ~ddbh)) %>%
+    dplyr::select(-.sc_qmd, -.sc_mat, -.eff_hi, -.eff_lo)
   
   # Apply diameter growth cap if requested
   if (use.cap.dbh == TRUE) {
@@ -1186,6 +1418,50 @@ dht = function(ht, cr, ccfl, csi, dht.b0.spp, dht.b2.spp) {
   
   dht
 }
+
+#' Lever 4 (v12.11): hardwood form and risk HEIGHT modifier
+#'
+#' Multiplicative modifier on the annual height increment dht, normalized to 1 at the reference
+#' state (form A, low risk), so gate-off and reference trees are unchanged. Same NHRI class
+#' collapse and six-species scope as ddbh_hw_mod (Castle et al. 2018): form A = ideal (F1/F3/F4/F7)
+#' vs B, risk LR = low (R1/R2) vs HR (R3/R4); species RO, SM, YB, RM, PB, QA (AB excluded, its
+#' height growth moves the other way). Species-specific risk coefficients fit 21 July 2026 from FIA
+#' ME GRM remeasurement pairs (ANN_HT_GROWTH ~ sp*risk + log(dbh), PB reference, DAMAGE_AGENT_CD1
+#' risk proxy). The form coefficient is an unvalidated placeholder scaled from Castle's own
+#' form:risk magnitude ratio (CULLFORM is unpopulated in FIA; no field NHRI form data staged);
+#' override via ops$dht.hw.gamma.form once field data exist. Closes a real gap: the base dht() has
+#' no dbh, form, or risk term, so this does not double count the diameter-side ddbh_hw_mod.
+dht_hw_mod = function(sp, dbh, form, risk, spp.coeff.risk, gamma.form) {
+  if (is.na(form) | !(gsub('[^0-9]', '', form) %in% 1:8) |
+      is.na(risk) | !(gsub('[^0-9]', '', risk) %in% 1:4) |
+      !sp %in% c('RO', 'SM', 'YB', 'RM', 'PB', 'QA')) {
+    return(1)
+  }
+  new.form = ifelse(form %in% c('F1', 'F7', 'F3', 'F4'), 'A', 'B')
+  new.risk = ifelse(risk %in% c('R1', 'R2'), 'LR', 'HR')
+  form.b = ifelse(new.form == 'B', 1, 0)
+  hr     = ifelse(new.risk == 'HR', 1, 0)
+  base.risk.coeff = -0.1380   # PB reference risk effect (log scale)
+  dht.hw.mod = exp(base.risk.coeff * hr + spp.coeff.risk * hr + gamma.form * form.b)
+  dht.hw.mod = pmax(0.5, pmin(1.2, dht.hw.mod))
+  dht.hw.mod
+}
+
+# Lever 4 species risk coefficients (log scale), PB reference, matching ddbh.hw.mod.spp convention.
+# Fitted 21 July 2026 from Smith field NHRI data (EquivalenceData.csv, total-height ~ log(dbh) +
+# form + risk, n = 117 to 266 per species): high-risk trees are shorter by YB -10.9 pct, SM -10.8
+# pct (both p < 0.002), RM -2.3 pct (NS). spp.coeff.risk = species total risk log-deficit minus the
+# PB reference base.risk.coeff. RO, QA, PB carry the FIA-GRM estimate (not in the Smith height set).
+dht.hw.mod.spp = tibble::tribble(
+  ~species, ~spp.coeff.risk,
+  'RO',  0.0220,   # red-team fix: capped to the YB/SM field magnitude (was -0.1520). RO is absent
+                   #  from the Smith height set (n=1) so its FIA-GRM-proxy value was the largest and
+                   #  least-validated of the six; cap pending Castle RO field heights (HRF join).
+  'SM',  0.0230,
+  'YB',  0.0220,
+  'RM',  0.1150,
+  'QA',  0.0210,
+  'PB',  0.0)
 
 #' Calculate height thinning modifier
 #' 
@@ -1353,11 +1629,30 @@ calc_dht = function(tree.data, plot.data, csi = stand$csi,
     tree = tree %>%
       dplyr::mutate(dht.sbw.mod = 1)
   }
-  
-  
+
+  # Lever 4 (v12.11): hardwood form/risk HEIGHT modifier. Gated ops$use.dht.hw.mod (default OFF =>
+  # dht.hw.mod = 1, product unchanged, byte-identical to the base at default ops). form/risk columns
+  # already exist on tree.data (consumed by calc_ddbh's ddbh_hw_mod); no new upstream plumbing. Uses
+  # a separate flag from ops$use.hw.mod so the height correction ships and tests independently of the
+  # diameter and mortality form/risk modifiers.
+  if (isTRUE(ops$use.dht.hw.mod)) {
+    .dhthw_gform = tryCatch(if (!is.null(ops$dht.hw.gamma.form) && !is.na(ops$dht.hw.gamma.form)) ops$dht.hw.gamma.form else -0.020, error=function(e) -0.020)
+    tree = tree %>%
+      dplyr::mutate(idx.hw.ht = match(sp, dht.hw.mod.spp$species,
+                                      nomatch = match('PB', dht.hw.mod.spp$species)),
+                    hw.ht.spp.coeff = dht.hw.mod.spp$spp.coeff.risk[idx.hw.ht],
+                    dht.hw.mod = ifelse(!is.na(form) & !is.na(risk),
+                                        purrr::pmap_dbl(list(sp, dbh, form, risk, hw.ht.spp.coeff, .dhthw_gform), dht_hw_mod),
+                                        1)) %>%
+      dplyr::select(-idx.hw.ht, -hw.ht.spp.coeff)
+  } else {
+    tree = tree %>%
+      dplyr::mutate(dht.hw.mod = 1)
+  }
+
   # Apply modifiers
   tree = tree %>%
-    dplyr::mutate(dht = dht * dht.thin.mod * dht.sbw.mod * dht.mult)
+    dplyr::mutate(dht = dht * dht.thin.mod * dht.sbw.mod * dht.hw.mod * dht.mult)
   
   # Apply height cap 
   if (use.cap.ht == TRUE) {
@@ -2013,7 +2308,7 @@ calc_mortality = function(tree.data, plot.data, region = stand$region,
   
   # Apply stand mortality basal area modifiers 
   tree = tree %>%
-    dplyr::mutate(stand.mort.ba = ifelse(stand.pmort > stand.prob.parms$cut,
+    dplyr::mutate(stand.mort.ba = ifelse(stand.pmort > stand.prob.parms$cut * tryCatch(if (!is.null(ops$mort.cut.scale) && !is.na(ops$mort.cut.scale)) ops$mort.cut.scale else 1, error=function(e) 1),
                                          stand.mort.ba * (1 / smort.thin.mod) * smort.sbw.mod,
                                          0),
                   stand.mort.ba = pmin(stand.mort.ba, ba.plot))
@@ -2272,9 +2567,17 @@ calc_mortality = function(tree.data, plot.data, region = stand$region,
       # Calculate ingrowth per hectare
       ingrowth.ph = exp(eta)
       
-      # Apply probability threshold
-      ingrowth.ph = ifelse(ingrowth.prob >= cut.point.ingrowth, ingrowth.ph, 0)
-      
+      # Apply occurrence gate. Default behavior: hard threshold (ingrowth occurs
+      # only where occurrence probability >= cut.point.ingrowth). The published
+      # default 0.95 effectively suppresses ingrowth on most plot-years. Setting
+      # cut.point.ingrowth <= 0 switches to the statistically correct annualized
+      # EXPECTED value of the zero-inflated model: E[ingrowth] = P(occur) * E[count].
+      if (cut.point.ingrowth <= 0) {
+        ingrowth.ph = ingrowth.prob * ingrowth.ph
+      } else {
+        ingrowth.ph = ifelse(ingrowth.prob >= cut.point.ingrowth, ingrowth.ph, 0)
+      }
+
       ingrowth.ph
     }
     
@@ -2342,10 +2645,13 @@ calc_mortality = function(tree.data, plot.data, region = stand$region,
         dplyr::mutate(sp=sp.grp.ingrowth) %>% 
         dplyr::bind_rows(tree.group.ingrowth)%>% 
         dplyr::filter(sp.ing>0) %>% 
-        dplyr::transmute(plot, 
+        dplyr::transmute(plot,
                          tree = max.tree.id + row_number(),
                          sp,
-                         dbh = min.dbh.ingrowth,
+                         # recruit-entry diameter: place merchantable ingrowth at the
+                         # merch threshold (FIA merchantable-ingrowth convention) when
+                         # ops$ingrowth.entry.dbh is set; otherwise the model default.
+                         dbh = tryCatch(if (exists('ops') && !is.null(ops$ingrowth.entry.dbh) && !is.na(ops$ingrowth.entry.dbh)) ops$ingrowth.entry.dbh else min.dbh.ingrowth, error=function(e) min.dbh.ingrowth),
                          expf = sp.ing,
                          ht = NA_real_,
                          hcb = NA_real_,
@@ -2425,7 +2731,45 @@ calc_mortality = function(tree.data, plot.data, region = stand$region,
                                                   a5 = parms$a5, a6 = parms$a6, a7 = parms$a7,
                                                   b1 = parms$b1, b2 = parms$b2, b3 = parms$b3, b4 = parms$b4,
                                                   b5 = parms$b5, b6 = parms$b6, b7 = parms$b7))
-      
+
+      # Ingrowth calibration multiplier (product-mix calibration): scales predicted
+      # recruits-per-ha. OFF (=1) unless ops$ingrowth.mult is set. Corrects the
+      # documented under-recruitment of small trees on long-horizon projections.
+      .ing_mult = tryCatch(if (exists('ops') && !is.null(ops$ingrowth.mult) && !is.na(ops$ingrowth.mult)) ops$ingrowth.mult else 1, error = function(e) 1)
+      plot.data$ingrowth.ph = plot.data$ingrowth.ph * .ing_mult
+
+      # Lever 1 (v12.11): recruitment RD taper. Gated ops$use.ingrowth.rdtaper (default OFF =>
+      # skipped, byte-identical to 12.10.2). The flat BA-anchored ingrowth deficit (about 2.5x)
+      # is handled by ops$ingrowth.mult above; this taper instead scales recruits per ha by
+      # m(RD) = t0 + t1*(1 - logistic(tk*(RD - tc))), about t0+t1 in open stands tapering to t0
+      # as RD -> 1, so mature closed stands (Baxter own ingrowth ratio only 1.31) are protected
+      # from the flat multiplier. Use the taper OR a flat ops$ingrowth.mult, not both. Defaults
+      # t0=1.4, t1=1.4, tk=12, tc=0.80. Owns ONLY the count/BA ingrowth deficit; recruit
+      # diameter growth belongs to lever 3, do not double count.
+      .rdt_on = tryCatch(if (!is.null(ops$use.ingrowth.rdtaper)) isTRUE(ops$use.ingrowth.rdtaper) else FALSE, error=function(e) FALSE)
+      if (.rdt_on && !is.null(plot.data$rd.mod)) {
+        .rdt_t0 = tryCatch(if (!is.null(ops$ingrowth.rdt.t0) && !is.na(ops$ingrowth.rdt.t0)) ops$ingrowth.rdt.t0 else 1.4, error=function(e) 1.4)
+        .rdt_t1 = tryCatch(if (!is.null(ops$ingrowth.rdt.t1) && !is.na(ops$ingrowth.rdt.t1)) ops$ingrowth.rdt.t1 else 1.4, error=function(e) 1.4)
+        .rdt_k  = tryCatch(if (!is.null(ops$ingrowth.rdt.k)  && !is.na(ops$ingrowth.rdt.k))  ops$ingrowth.rdt.k  else 12,   error=function(e) 12)
+        .rdt_c  = tryCatch(if (!is.null(ops$ingrowth.rdt.c)  && !is.na(ops$ingrowth.rdt.c))  ops$ingrowth.rdt.c  else 0.80, error=function(e) 0.80)
+        .rdt_rd = dplyr::coalesce(plot.data$rd.mod, 0)
+        .rdt_m  = .rdt_t0 + .rdt_t1 * (1 - 1 / (1 + exp(-.rdt_k * (.rdt_rd - .rdt_c))))
+        plot.data$ingrowth.ph = plot.data$ingrowth.ph * .rdt_m
+      }
+
+      # v12.7.1 density-released ingrowth: recruitment suppressed at high relative
+      # density (RD = SDI/SDImax) and released below about 0.5 to 0.6 via a logistic
+      # in RD. Coupled with the two-segment RD mortality above, this yields the
+      # build -> plateau (ride max) -> decline -> rebound shifting-mosaic dynamic
+      # (a damped oscillation) instead of a flat asymptote.
+      .ir_on = tryCatch(if (!is.null(ops$use.ingrowth.release)) isTRUE(ops$use.ingrowth.release) else TRUE, error=function(e) TRUE)
+      if (.ir_on && !is.null(plot.data$rd.mod)) {
+        .ir_c = tryCatch(if (!is.null(ops$ingrowth.rd.center) && !is.na(ops$ingrowth.rd.center)) ops$ingrowth.rd.center else 0.58, error=function(e) 0.58)
+        .ir_k = tryCatch(if (!is.null(ops$ingrowth.rd.k) && !is.na(ops$ingrowth.rd.k)) ops$ingrowth.rd.k else 8, error=function(e) 8)
+        .rel = 1 / (1 + exp(.ir_k * (dplyr::coalesce(plot.data$rd.mod, 0) - .ir_c)))
+        plot.data$ingrowth.ph = plot.data$ingrowth.ph * .rel
+      }
+
       # Ingrowth species groups
       species.groups = c('BF', 'RM', 'WP', 'SPR', 'BCH', 'OH', 
                          'OS', 'AB', 'QA', 'SM', 'WC')
@@ -2677,9 +3021,15 @@ make_ops = function(verbose = FALSE,
                     thin.qmd.ratio = NA_real_,
                     thin.year = NA_real_,
                     use.hw.mod = FALSE,
-                    use.ingrowth = FALSE,
+                    use.mgmt.mod = FALSE,
+                    mgmt.class = NA_character_,
+                    mgmt.tst = NA_real_,
+                    mgmt.planted.mult = 2.0,
+                    mgmt.pct.a = 1.0,
+                    mgmt.pct.b = 0.03,
+                    use.ingrowth = TRUE,
                     ingrowth.min.dbh = 3.0,
-                    ingrowth.thrshld = 0.95,
+                    ingrowth.thrshld = 0,
                     use.vol = FALSE) {
   
   # Convert strings to logical-- in case someone redefines TRUE and FALSE 
@@ -2712,16 +3062,23 @@ make_ops = function(verbose = FALSE,
                    thin.qmd.ratio = thin.qmd.ratio,
                    thin.year = thin.year,
                    use.hw.mod = char_to_logical(use.hw.mod),
+                   use.mgmt.mod = char_to_logical(use.mgmt.mod),
+                   mgmt.class = mgmt.class,
+                   mgmt.tst = mgmt.tst,
+                   mgmt.planted.mult = mgmt.planted.mult,
+                   mgmt.pct.a = mgmt.pct.a,
+                   mgmt.pct.b = mgmt.pct.b,
                    use.ingrowth = char_to_logical(use.ingrowth),
                    ingrowth.min.dbh = ingrowth.min.dbh,
                    ingrowth.thrshld = ingrowth.thrshld,
                    use.vol=use.vol) %>%
-    dplyr::mutate(dplyr::across(c(verbose, use.cap.dbh, use.cap.ht, use.sbw.mod, 
-                                  use.thin.mod, use.hw.mod, use.ingrowth), 
+    dplyr::mutate(dplyr::across(c(verbose, use.cap.dbh, use.cap.ht, use.sbw.mod,
+                                  use.thin.mod, use.hw.mod, use.mgmt.mod, use.ingrowth),
                                 as.logical),
-                  dplyr::across(c(sbw.cdef, sbw.yr, sbw.dur, thin.ba.perc.rmv, 
-                                  thin.ba.pre, thin.qmd.ratio, thin.year, 
-                                  ingrowth.min.dbh, ingrowth.thrshld), 
+                  dplyr::across(c(sbw.cdef, sbw.yr, sbw.dur, thin.ba.perc.rmv,
+                                  thin.ba.pre, thin.qmd.ratio, thin.year,
+                                  mgmt.tst, mgmt.planted.mult, mgmt.pct.a, mgmt.pct.b,
+                                  ingrowth.min.dbh, ingrowth.thrshld),
                                 as.numeric))
   
   # rtn.vars as a list column 
@@ -2824,12 +3181,14 @@ validate_ops = function(ops) {
   make_stand= function(stand.id,
                        csi =12,
                        elev =350, 
-                       region = 'ME'){
+                       region = 'ME',
+                       esi = NA_real_){
     
     stand=data.frame(stand.id=stand.id,
-                     csi = as.numeric(csi),
+                     csi = if (is.finite(esi)) as.numeric(esi) else as.numeric(csi),
                      elev = as.numeric(elev), 
-                     region = region)
+                     region = region,
+                     site.source = if (is.finite(esi)) 'ESI' else 'CSI')
     
     stand
     
@@ -3088,7 +3447,7 @@ calc_plot_summary = function(tree.data) {
 #' @param elev Numeric: Elevation (m)
 #' @return Dataframe: Input data with added SDI max columns (sdi.max, sdi.max.all)
 #'
-calc_sdi_max = function(plot.data, tree.data, csi, elev) {
+calc_sdi_max = function(plot.data, tree.data, csi, elev, sdimax.csi.term = TRUE) {
   
   # Check required columns in plot.data
   required.cols = c('plot', 'ba.perc.hw', 'meansg')
@@ -3117,7 +3476,7 @@ calc_sdi_max = function(plot.data, tree.data, csi, elev) {
   sdi_max_weiskittel = function(ba.perc.hw, meansg, dbh.range, spp.div, elev, csi) {
     sdimax = 475.2079 - 1.5908 * ba.perc.hw - 236.9051 * log(meansg) + 
       50.3299 * sqrt(dbh.range) + 13.5202 * spp.div + 
-      0.0685 * elev - 2.8537 * sqrt(elev) + 222.7836 / csi
+      0.0685 * elev - 2.8537 * sqrt(elev) + (if (isTRUE(sdimax.csi.term)) 222.7836 / csi else 15.6)
     
     sdimax
   }
@@ -3268,7 +3627,49 @@ AcadianGYOneStand = function(tree, stand, ops)
     calc_sdi_max(plot.data = ., 
                  tree.data = tree, 
                  csi = stand$csi, 
-                 elev = stand$elev) %>% 
+                 elev = stand$elev,
+                 sdimax.csi.term = isTRUE(ops$sdimax.site.term)) %>% 
+    # v12.9: region-specific SDImax multiplier (regional and composition-aware mortality
+    # refit target). ops$sdimax.region.mult is a named numeric vector, e.g.
+    # c(NB=1.0, QC=1.15, ME=1.0, NS=1.0); gated, defaults to 1 (=> 12.7.1 exactly) when
+    # unset or when the stand's region is not in the vector.
+    dplyr::mutate(.rmult = {
+      rv <- tryCatch(ops$sdimax.region.mult, error = function(e) NULL)
+      if (is.list(rv) && length(rv) >= 1) rv <- rv[[1]]
+      if (is.null(rv) || is.null(stand$region) || is.na(stand$region) ||
+          !(stand$region %in% names(rv))) 1 else as.numeric(rv[[stand$region]])
+    }) %>%
+    # v12.9b: forest-type (region x dominant species group) multiplier, layered on top of the
+    # region multiplier. Dominant group = BA-weighted mode of sp.attr$sp.grp.ingrowth for the
+    # plot's tree list (already joined onto `tree` earlier in AcadianGYOneStand). Gated via
+    # ops$sdimax.fortype.tight.mult (scalar, default 1) and ops$sdimax.fortype.tight.groups
+    # (character vector of sp.grp.ingrowth codes to tighten, default none) and
+    # ops$sdimax.fortype.region (character vector of regions the correction applies in,
+    # default all). Unset => no change from v12.9 (region-only).
+    dplyr::mutate(.fmult = {
+      tm <- tryCatch(as.numeric(ops$sdimax.fortype.tight.mult), error = function(e) NA_real_)
+      tg <- tryCatch(ops$sdimax.fortype.tight.groups, error = function(e) NULL)
+      tr <- tryCatch(ops$sdimax.fortype.region, error = function(e) NULL)
+      if (is.list(tg) && length(tg) >= 1) tg <- tg[[1]]
+      if (is.list(tr) && length(tr) >= 1) tr <- tr[[1]]
+      if (is.na(tm) || is.null(tg) || length(tg) == 0) {
+        rep(1, nrow(.))
+      } else if (!is.null(tr) && length(tr) > 0 &&
+                 !((if (exists("ops") && !is.null(tryCatch(ops$active_ecobucket, error=function(e) NULL)))
+                     ops$active_ecobucket else stand$region) %in% tr)) {
+        rep(1, nrow(.))
+      } else {
+        dom <- tree %>% dplyr::filter(!is.na(sp.grp.ingrowth)) %>%
+          dplyr::group_by(plot, sp.grp.ingrowth) %>%
+          dplyr::summarise(ba.grp = sum(ba, na.rm = TRUE), .groups = "drop") %>%
+          dplyr::arrange(plot, dplyr::desc(ba.grp)) %>%
+          dplyr::group_by(plot) %>% dplyr::slice(1) %>% dplyr::ungroup()
+        dg <- dom$sp.grp.ingrowth[match(.$plot, dom$plot)]
+        ifelse(!is.na(dg) & dg %in% tg, tm, 1)
+      }
+    }) %>%
+    dplyr::mutate(sdi.max = sdi.max * .rmult * .fmult, sdi.max.all = sdi.max.all * .rmult * .fmult) %>%
+    dplyr::select(-.rmult, -.fmult) %>%
     # Relative density
     dplyr::mutate(rd.mod = calc_relative_density(sdi, 
                                           sdi.all, 
@@ -3375,7 +3776,116 @@ AcadianGYOneStand = function(tree, stand, ops)
                   expf= dplyr::coalesce(expf, 0) - dplyr::coalesce(dexpf, 0),
                   expf= ifelse(expf< 0.00001, 0.00001, expf),
                   cr= 1-(hcb/ht)) 
+
+  # ---- v12.7.0: ESI-anchored dominant height (fitted Chapman-Richards, ESI v8) ----
+  .edh_on = tryCatch(if (!is.null(ops$use.esi.domht)) isTRUE(ops$use.esi.domht) else FALSE, error=function(e) FALSE)
+  if (.edh_on) {
+    .k <- 0.0039; .p <- 0.726; .base <- 50
+    .esi <- tryCatch(as.numeric(stand$csi), error=function(e) NA_real_)
+    .age0 <- tryCatch(if (!is.null(ops$esi.domht.age0) && !is.na(ops$esi.domht.age0)) ops$esi.domht.age0 else 0, error=function(e) 0)
+    .gain <- tryCatch(if (!is.null(ops$esi.domht.gain) && !is.na(ops$esi.domht.gain)) ops$esi.domht.gain else 1, error=function(e) 1)
+    .afac <- tryCatch(if (!is.null(ops$esi.domht.afac) && !is.na(ops$esi.domht.afac)) as.numeric(ops$esi.domht.afac) else 1, error=function(e) 1)
+    .age <- .age0 + tree$year[1]
+    if (is.finite(.esi) && .esi > 2 && .age > 0) {
+      .Aasym <- (.esi / .afac) / ((1 - exp(-.k*.base))^.p)
+      .target <- .Aasym * (1 - exp(-.k*.age))^.p
+      .spl <- split(seq_len(nrow(tree)), tree$plot); .cf <- rep(1, nrow(tree))
+      for (.ix in .spl) {
+        g <- tree[.ix, ]; o <- order(-g$dbh); e <- g$expf[o]; cw <- cumsum(e)
+        kk <- which(cw >= 100)[1]; if (is.na(kk)) kk <- length(e)
+        topht <- weighted.mean(g$ht[o][seq_len(kk)], e[seq_len(kk)], na.rm=TRUE)
+        cf <- if (is.finite(topht) && topht > 1.5) 1 + .gain*(.target/topht - 1) else 1
+        .cf[.ix] <- min(1.3, max(0.7, cf))
+      }
+      tree$ht <- pmax(1.3, tree$ht * .cf)
+      # v12.11 red-team blocker fix (gated): the ESI anchor rescales height AFTER calc_dht's own
+      # height-cap enforcement and was never re-checked, so on good sites at long horizons it could
+      # push trees about 30 pct over max.height and drive a non-monotonic dominant-height trajectory.
+      # ops$use.htcap.postanchor (default OFF => pre-existing behavior, byte-identical to frozen) re-
+      # applies the per-tree cap after the anchor rescale. Enable it in the candidate.
+      if (isTRUE(ops$use.htcap.postanchor)) {
+        .mh_pa <- if (!is.null(tree$max.height)) tree$max.height else NA_real_
+        tree$ht <- pmin(tree$ht, ifelse(is.finite(.mh_pa), .mh_pa, Inf))
+      }
+      tree$cr <- pmax(0, pmin(1, 1 - (tree$hcb / tree$ht)))
+    }
+  }
+
+
+  # ---- v12.6 SDImax-ceiling self-thinning mortality (opt-in, default ON) ----
+  # Density-dependent survivor mortality keyed on relative density RD = SDI / SDImax,
+  # evaluated on the post-growth, post-base-mortality tree list. Below `onset` nothing
+  # happens, so sub-maximal stands reproduce 12.5.0. Above `onset` an annual extra
+  # mortality removes stems in proportion to the overshoot (beta), and a hard ceiling
+  # holds post-step RD at `max`, so a fully stocked stand rides the Reineke
+  # self-thinning line. ops$use.sdimort = FALSE => identical to 12.5.0.
+  .sdm_on = tryCatch(if (!is.null(ops$use.sdimort)) isTRUE(ops$use.sdimort) else TRUE, error=function(e) TRUE)
+  if (.sdm_on) {
+    # v12.7.1 coupled two-segment self-thinning: zero below onset, a GENTLE linear
+    # ramp between onset and break, a STEEP ramp above break so BA and SDI ride the
+    # maximum line. Gentle segment leaves moderate-density growing stands (NB) nearly
+    # untouched; steep segment self-thins mature dense stands (QC) hard. Back-compat:
+    # if ops$sdimort.break is NULL and ops$sdimort.beta is set, the single-slope 12.7.0
+    # form is reproduced (beta.gentle=beta.steep=beta, break=onset).
+    .sdm_onset = tryCatch(if (!is.null(ops$sdimort.onset) && !is.na(ops$sdimort.onset)) ops$sdimort.onset else 0.30, error=function(e) 0.30)
+    .sdm_break = tryCatch(if (!is.null(ops$sdimort.break) && !is.na(ops$sdimort.break)) ops$sdimort.break else 0.62, error=function(e) 0.62)
+    .sdm_bg    = tryCatch(if (!is.null(ops$sdimort.beta.gentle) && !is.na(ops$sdimort.beta.gentle)) ops$sdimort.beta.gentle else tryCatch(if(!is.null(ops$sdimort.beta) && !is.na(ops$sdimort.beta)) ops$sdimort.beta else 0.02, error=function(e) 0.02), error=function(e) 0.02)
+    .sdm_bs    = tryCatch(if (!is.null(ops$sdimort.beta.steep)  && !is.na(ops$sdimort.beta.steep))  ops$sdimort.beta.steep  else 0.80, error=function(e) 0.80)
+    .sdm_max   = tryCatch(if (!is.null(ops$sdimort.max)   && !is.na(ops$sdimort.max))   ops$sdimort.max   else 1.00, error=function(e) 1.00)
+    if (.sdm_break < .sdm_onset) .sdm_break <- .sdm_onset
+    # Lever 2 (v12.11): management-gated attenuation of the self-thinning removal fraction.
+    # Gated ops$mort.dens.scale (default OFF => attenuation factor is exactly 1, byte-identical
+    # to 12.10.2). For managed/thinned stands the removal fraction sdm_mfrac is scaled by
+    # f(RD) = fmin + (1-fmin)*exp(-k*max(RD - RD0, 0)), RD = SDI/sdimax (fit basis 1200); natural
+    # stands take f = 1. Corrects SILC-anchored over-removal at managed high-density residuals
+    # (CTRN predicted 4.6x observed, NB 2.5x) while leaving natural self-thinning (Baxter, Maine
+    # FIA) untouched. Fitted fmin=0.13, k=12.4, RD0=0.38 (fit_mort_v1211.R). Managed status from
+    # ops$stand.managed if given, else inferred from planted/PCT mgmt.class or an active thinning.
+    .mds_on = tryCatch(if (!is.null(ops$mort.dens.scale)) isTRUE(ops$mort.dens.scale) else FALSE, error=function(e) FALSE)
+    .mds_managed = FALSE
+    if (.mds_on) {
+      .mds_managed = tryCatch({
+        if (!is.null(ops$stand.managed)) isTRUE(ops$stand.managed)
+        else ((!is.null(ops$mgmt.class) && !is.na(ops$mgmt.class) && toupper(as.character(ops$mgmt.class)) %in% c('PLANTED','PCT')) ||
+              (!is.null(ops$thin.year) && !is.na(ops$thin.year)))
+      }, error=function(e) FALSE)
+    }
+    .mds_fmin   = tryCatch(if (!is.null(ops$mort.dens.fmin)   && !is.na(ops$mort.dens.fmin))   ops$mort.dens.fmin   else 0.13, error=function(e) 0.13)
+    .mds_k      = tryCatch(if (!is.null(ops$mort.dens.k)      && !is.na(ops$mort.dens.k))      ops$mort.dens.k      else 12.4, error=function(e) 12.4)
+    .mds_rd0    = tryCatch(if (!is.null(ops$mort.dens.rd0)    && !is.na(ops$mort.dens.rd0))    ops$mort.dens.rd0    else 0.38, error=function(e) 0.38)
+    .mds_sdimax = tryCatch(if (!is.null(ops$mort.dens.sdimax) && !is.na(ops$mort.dens.sdimax)) ops$mort.dens.sdimax else 1200, error=function(e) 1200)
+    tree = tree %>%
+      dplyr::left_join(dplyr::transmute(plot.smry, plot, sdm_sdimax = sdi.max), by = 'plot') %>%
+      dplyr::group_by(plot) %>%
+      dplyr::mutate(sdm_sdi   = sum(ifelse(dbh >= 10, (dbh / 25.4)^1.6 * expf, 0), na.rm = TRUE),
+                    sdm_rd    = ifelse(!is.na(sdm_sdimax) & sdm_sdimax > 0, sdm_sdi / sdm_sdimax, 0),
+                    sdm_mfrac = .sdm_bg * pmin(pmax(sdm_rd - .sdm_onset, 0), .sdm_break - .sdm_onset) + .sdm_bs * pmax(sdm_rd - .sdm_break, 0),
+                    sdm_mfrac = sdm_mfrac * (if (.mds_on && .mds_managed) (.mds_fmin + (1 - .mds_fmin) * exp(-.mds_k * pmax(sdm_sdi / .mds_sdimax - .mds_rd0, 0))) else 1),
+                    sdm_keepi = ifelse(sdm_rd > .sdm_onset, pmax(0, 1 - sdm_mfrac), 1),
+                    sdm_keepc = ifelse(sdm_rd * sdm_keepi > .sdm_max & sdm_rd > 0, .sdm_max / (sdm_rd * sdm_keepi), 1),
+                    sdm_keepi = pmax(0, pmin(1, sdm_keepi)),
+                    sdm_keepc = pmax(0, pmin(1, sdm_keepc)),
+                    expf      = expf * sdm_keepi * sdm_keepc,
+                    expf      = ifelse(expf < 0.00001, 0.00001, expf)) %>%
+      dplyr::ungroup() %>%
+      dplyr::select(-sdm_sdimax, -sdm_sdi, -sdm_rd, -sdm_mfrac, -sdm_keepi, -sdm_keepc)
+  }
   
+  # ---- #126b size-dependent survivor mortality correction (opt-in) --------
+  # Applied to SURVIVORS only, keyed on post-growth DBH (cm -> in) and annualised
+  # over ops$mortcal.interval so it compounds across the caller annual loop.
+  # Ingrowth is bound in below, so fresh recruits are NOT haircut. OFF unless
+  # ops$use.mortcal is TRUE => then identical to pristine 12.5.0.
+  if (isTRUE(ops$use.mortcal)) {
+    .mc_iv = if (!is.null(ops$mortcal.interval) && !is.na(ops$mortcal.interval)) ops$mortcal.interval else 5
+    # mortcal.lambda tempers the haircut: 1 = full (BA-targeted) MORTCAL, 0 = off.
+    # A volume-targeted MORTCAL-V uses 0 < lambda < 1.
+    .mc_lam = if (!is.null(ops$mortcal.lambda) && !is.na(ops$mortcal.lambda)) ops$mortcal.lambda else 1
+    tree = tree %>%
+      dplyr::mutate(expf = expf * .mortcal_surv_ratio(dbh / 2.54)^(.mc_lam / .mc_iv),
+                    expf = ifelse(expf < 0.00001, 0.00001, expf))
+  }
+
   # Append ingrowth
   if(exists('ingrowth')){
     tree=tree %>% 
