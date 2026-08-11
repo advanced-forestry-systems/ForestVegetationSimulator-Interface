@@ -14,7 +14,146 @@
 library(dplyr) # needed arrange, mutate, left_join, tibble, select, group_by, summarise, ungroup, case_when, all_of
 library(purrr) # needed for pmap_*
 
-AcadianVersionTag = "AcadianV12.11"
+AcadianVersionTag = "AcadianV13.1"
+
+# ---------------------------------------------------------------------------
+# v13.1 (DRAFT) hierarchical recruitment and mortality: the fitted posteriors REPLACE
+#   the two v12.11 hand-tuned levers. Two new gated switches, both OFF by default, so with
+#   them OFF and no v12.11 lever set the build is BYTE-IDENTICAL to frozen v12.10.1 on a
+#   20-year young/mature projection (max abs diff 0.000e+00), the same discipline v12.11 proved.
+#   The v12.11 levers, their env-var wiring, and make_ops are all preserved unchanged; the two
+#   v13.1 switches are added alongside them.
+#
+#   SWITCH A  ops$use.hier.ingrowth (default FALSE). When TRUE, stand recruitment is set from the
+#     converged hierarchical negbinomial (log link) ingrowth posterior (Cardinal job 12470707 v5)
+#     INSTEAD of the v12.11 flat ops$ingrowth.mult (about 2.5x). Predicted recruits per ha per year
+#     = exp( b0 + b_rd*z(rd) + b_lnqmd*z(ln qmd) + b_ba*z(ba) + u_region + u_eco + u_fortype ),
+#     with z() the saved training standardization (v131r_scaling.csv) and the log_years offset = 0
+#     at the engine's 1-year cycle. It carries the fitted density and composition dependence (QMD
+#     down, BA up) the flat multiplier could not.
+#
+#   SWITCH B  ops$use.hier.mortality (default FALSE). When TRUE, the annual mortality hazard is set
+#     from the management-FREE hierarchical binomial (cloglog link) mortality posterior (job 12526556
+#     v131mortB, re-nested (1|region)+(1|region:eco)+(1|fortype), NO management term) INSTEAD of the
+#     v12.11 management-gated attenuation f(RD)=fmin+(1-fmin)exp(-k max(RD-RD0,0)) (fmin 0.13, k 12.4,
+#     RD0 0.38). The posterior enters at the SAME point the v12.11 gate sat, as a management-free
+#     multiplicative hazard modifier on the self-thinning removal fraction, so Reineke self-thinning
+#     and the density plateau (frozen-base structure) are preserved. The fitted crossed random effects
+#     replace what the hand-tuned management gate crudely approximated. This is the structure that
+#     addresses the two v12.11 managed flags: the QC volume over-correction and the SILC basal-area
+#     widening both trace to the hand-tuned management gate (see 20260722_v131_stress_redteam_review.md
+#     item 3 and 20260722_v131_harvest_and_mort_repair.md).
+#
+#   RUNTIME LOAD, not hardcoded. Both posteriors are read from CSV at runtime from ops$hier.postdir
+#   (default ~/v13_kickoff; point it at ~/v13_subplot for the subplot-grain posteriors). Ingrowth reads
+#   v131r_ingrowth_fixef.csv, v131r_ingrowth_varcomp.csv, v131r_scaling.csv. Mortality reads
+#   v131r_mortB_fixef.csv, v131r_mortB_varcomp.csv, v131r_mortB_scaling.csv. Per-group random
+#   intercepts are matched from an OPTIONAL <prefix>_ranef.csv when present; when absent (or a group
+#   level is unseen), that grouping's random intercept is 0, i.e. the correct partial-pooling
+#   population-level prediction. The fit-grain grouping levels (region ~48, eco ~84, fortype) are not
+#   in the FVS-ACD stand object (stand$region is the coarse ME/NB/NS/QC code), so they are supplied
+#   per stand via ops$hier.region / ops$hier.eco / ops$hier.fortype; unset => population-level.
+# ---------------------------------------------------------------------------
+# ==== v13.1 hierarchical posterior runtime loader (gated; inert unless a switch is ON) ====
+# Reads the fixef / varcomp / scaling (and optional ranef) CSVs written by the Cardinal refit
+# (v131_mort_ingrowth_refit.R and v131_mort_repair_v6.R). Coefficients are NEVER hardcoded here.
+# Memoized per (submodel, postdir) so the files are read once per projection, not every cycle.
+.acd_hier_env <- new.env(parent = emptyenv())
+
+.acd_read_csv = function(path) {
+  if (is.null(path) || is.na(path) || !file.exists(path)) return(NULL)
+  tryCatch(utils::read.csv(path, stringsAsFactors = FALSE, check.names = FALSE),
+           error = function(e) NULL)
+}
+
+# Load one submodel's posterior into a compact list of scalars + optional ranef table.
+# which = 'ingrowth' (negbinomial/log) or 'mortality' (binomial/cloglog, re-nested).
+.acd_hier_load = function(postdir, which = c('ingrowth', 'mortality')) {
+  which  = match.arg(which)
+  postdir = path.expand(as.character(postdir))
+  key = paste(which, postdir, sep = '|')
+  if (!is.null(.acd_hier_env[[key]])) return(.acd_hier_env[[key]])
+
+  prefix = if (which == 'ingrowth') 'v131r_ingrowth' else 'v131r_mortB'
+  scalef = if (which == 'ingrowth') 'v131r_scaling.csv' else 'v131r_mortB_scaling.csv'
+
+  fx = .acd_read_csv(file.path(postdir, paste0(prefix, '_fixef.csv')))
+  vc = .acd_read_csv(file.path(postdir, paste0(prefix, '_varcomp.csv')))   # loaded for structure/SD
+  sc = .acd_read_csv(file.path(postdir, scalef))
+  rf = .acd_read_csv(file.path(postdir, paste0(prefix, '_ranef.csv')))      # OPTIONAL
+
+  if (is.null(fx) || is.null(sc))
+    stop("v13.1 hierarchical ", which, " posterior not found under '", postdir,
+         "': need ", prefix, "_fixef.csv and ", scalef,
+         ". Set ops$hier.postdir or disable ops$use.hier.", which, ".")
+
+  # fixed effects: first column holds the term names, 'Estimate' (brms/lme4) holds the point value
+  tcol = names(fx)[[1]]
+  ecol = if ('Estimate' %in% names(fx)) 'Estimate' else names(fx)[[2]]
+  terms = trimws(as.character(fx[[tcol]]))
+  vals  = suppressWarnings(as.numeric(fx[[ecol]]))
+  getb  = function(cands) { i = which(terms %in% cands)[1]; if (is.na(i)) 0 else vals[i] }
+  b0    = getb(c('Intercept', '(Intercept)'))
+  b_rd  = getb(c('rd_z', 'rd'))
+  b_lnq = getb(c('lnqmd_z', 'ln_qmd_z', 'lnqmd', 'ln_qmd'))
+  b_ba  = getb(c('ba_z', 'ba'))
+
+  # scaling: rows var in {rd, ln_qmd, ba}, columns mean and sd
+  svar = trimws(as.character(sc[['var']]))
+  smu  = suppressWarnings(as.numeric(sc[['mean']]))
+  ssd  = suppressWarnings(as.numeric(sc[['sd']]))
+  gsc  = function(v, what) { i = which(svar == v)[1]; if (is.na(i)) NA_real_ else (if (what == 'mean') smu[i] else ssd[i]) }
+
+  out = list(
+    which = which, postdir = postdir,
+    b0 = b0, b_rd = b_rd, b_lnqmd = b_lnq, b_ba = b_ba,
+    m_rd = gsc('rd', 'mean'),      s_rd = gsc('rd', 'sd'),
+    m_lnqmd = gsc('ln_qmd', 'mean'), s_lnqmd = gsc('ln_qmd', 'sd'),
+    m_ba = gsc('ba', 'mean'),      s_ba = gsc('ba', 'sd'),
+    varcomp = vc, ranef = rf)
+  .acd_hier_env[[key]] = out
+  out
+}
+
+# Sum of matched random intercepts for one stand's group levels. Unmatched or absent -> 0
+# (population-level partial-pooling prediction). For mortality the crossed groups are
+# region, region:eco (nested), and fortype; for ingrowth region, eco, fortype.
+.acd_hier_re = function(rf, region = NA, eco = NA, fortype = NA) {
+  if (is.null(rf) || !all(c('grouping', 'level') %in% names(rf))) return(0)
+  ecol = if ('Estimate' %in% names(rf)) 'Estimate' else names(rf)[[which(!names(rf) %in% c('grouping', 'level'))[1]]]
+  grp  = trimws(as.character(rf$grouping)); lev = trimws(as.character(rf$level))
+  val  = suppressWarnings(as.numeric(rf[[ecol]]))
+  pick = function(gname, lval) {
+    if (is.na(lval)) return(0)
+    i = which(grp == gname & lev == as.character(lval))[1]
+    if (is.na(i) || !is.finite(val[i])) 0 else val[i]
+  }
+  reco = if (!is.na(region) && !is.na(eco)) paste(region, eco, sep = '_') else NA
+  pick('region', region) +
+    pick('eco', eco) +                                   # crossed-eco (ingrowth)
+    pick('region:eco', reco) + pick('region:eco', eco) + # nested-eco (mortality); try both label forms
+    pick('fortype', fortype)
+}
+
+# Standardized-covariate linear predictor DEVIATION (excludes intercept and offset):
+#   b_rd*z(rd) + b_lnqmd*z(ln qmd) + b_ba*z(ba) + (matched random intercepts).
+# Vectorized over rd/qmd/ba; grouping levels are stand scalars.
+.acd_hier_eta_dev = function(P, rd, qmd, ba, region = NA, eco = NA, fortype = NA) {
+  z_rd  = if (is.finite(P$s_rd)    && P$s_rd    > 0) (rd - P$m_rd) / P$s_rd            else 0
+  z_lnq = if (is.finite(P$s_lnqmd) && P$s_lnqmd > 0) (log(pmax(qmd, 1e-6)) - P$m_lnqmd) / P$s_lnqmd else 0
+  z_ba  = if (is.finite(P$s_ba)    && P$s_ba    > 0) (ba - P$m_ba) / P$s_ba            else 0
+  u = .acd_hier_re(P$ranef, region, eco, fortype)
+  P$b_rd * z_rd + P$b_lnqmd * z_lnq + P$b_ba * z_ba + u
+}
+
+# Stand grouping levels for the RE match, read defensively from ops (unset => NA => pop-level).
+.acd_hier_groups = function(ops) {
+  g = function(nm) tryCatch({ v = ops[[nm]]
+    if (is.null(v) || (length(v) == 1 && is.na(v))) NA else as.character(v)[1] },
+    error = function(e) NA)
+  list(region = g('hier.region'), eco = g('hier.eco'), fortype = g('hier.fortype'))
+}
+# ==== end v13.1 hierarchical posterior runtime loader ====
 
 # ---------------------------------------------------------------------------
 # 12.11 (maturity-gradient long-horizon volume correction; three gated levers, default OFF
@@ -2732,11 +2871,37 @@ calc_mortality = function(tree.data, plot.data, region = stand$region,
                                                   b1 = parms$b1, b2 = parms$b2, b3 = parms$b3, b4 = parms$b4,
                                                   b5 = parms$b5, b6 = parms$b6, b7 = parms$b7))
 
-      # Ingrowth calibration multiplier (product-mix calibration): scales predicted
-      # recruits-per-ha. OFF (=1) unless ops$ingrowth.mult is set. Corrects the
-      # documented under-recruitment of small trees on long-horizon projections.
-      .ing_mult = tryCatch(if (exists('ops') && !is.null(ops$ingrowth.mult) && !is.na(ops$ingrowth.mult)) ops$ingrowth.mult else 1, error = function(e) 1)
-      plot.data$ingrowth.ph = plot.data$ingrowth.ph * .ing_mult
+      # v13.1 SWITCH A (recruitment): hierarchical negbinomial ingrowth posterior REPLACES the
+      # v12.11 flat ops$ingrowth.mult. Gated ops$use.hier.ingrowth (default OFF => this branch is
+      # skipped entirely and the v12.11 flat-multiplier path below runs unchanged, byte-identical to
+      # frozen). When ON, the per-plot stand recruits per ha per year are SET to the posterior
+      # prediction exp( b0 + b_rd*z(rd) + b_lnqmd*z(ln qmd) + b_ba*z(ba) + REs ) (log_years offset = 0
+      # at the 1-year cycle), read at runtime from ops$hier.postdir; the flat ops$ingrowth.mult is NOT
+      # applied in this case. Covariates: rd = plot.data$rd.mod (SDI/SDImax), ba = ba.plot (m2/ha),
+      # qmd = plot.data$qmd (cm); standardized with the saved v131r_scaling.csv. Plots with no basis
+      # (qmd or ba not finite/positive) keep the base prediction to avoid NaN. The downstream density-
+      # release (ops$use.ingrowth.release) and composition split are frozen-base structure and still
+      # apply; see the model-file plan for the rd double-count note.
+      .hier_ing_on = tryCatch(if (!is.null(ops$use.hier.ingrowth)) isTRUE(ops$use.hier.ingrowth) else FALSE, error = function(e) FALSE)
+      if (.hier_ing_on) {
+        .pdir = tryCatch(if (!is.null(ops$hier.postdir) && !is.na(ops$hier.postdir)) as.character(ops$hier.postdir) else '~/v13_kickoff', error = function(e) '~/v13_kickoff')
+        .Ping = .acd_hier_load(.pdir, 'ingrowth')
+        .grp  = .acd_hier_groups(ops)
+        .rd_i = if (!is.null(plot.data$rd.mod)) dplyr::coalesce(plot.data$rd.mod, 0) else rep(0, nrow(plot.data))
+        .ba_i = dplyr::coalesce(plot.data$ba.plot, 0)
+        .qm_i = dplyr::coalesce(plot.data$qmd, 0)
+        .eta  = .Ping$b0 + .acd_hier_eta_dev(.Ping, rd = .rd_i, qmd = .qm_i, ba = .ba_i,
+                                             region = .grp$region, eco = .grp$eco, fortype = .grp$fortype)
+        .pred = exp(.eta)                                  # recruits per ha per year (log_years = 0)
+        .ok   = is.finite(.pred) & is.finite(.qm_i) & .qm_i > 0 & is.finite(.ba_i) & .ba_i > 0
+        plot.data$ingrowth.ph = ifelse(.ok, .pred, plot.data$ingrowth.ph)
+      } else {
+        # Ingrowth calibration multiplier (product-mix calibration): scales predicted
+        # recruits-per-ha. OFF (=1) unless ops$ingrowth.mult is set. Corrects the
+        # documented under-recruitment of small trees on long-horizon projections.
+        .ing_mult = tryCatch(if (exists('ops') && !is.null(ops$ingrowth.mult) && !is.na(ops$ingrowth.mult)) ops$ingrowth.mult else 1, error = function(e) 1)
+        plot.data$ingrowth.ph = plot.data$ingrowth.ph * .ing_mult
+      }
 
       # Lever 1 (v12.11): recruitment RD taper. Gated ops$use.ingrowth.rdtaper (default OFF =>
       # skipped, byte-identical to 12.10.2). The flat BA-anchored ingrowth deficit (about 2.5x)
@@ -3030,7 +3195,10 @@ make_ops = function(verbose = FALSE,
                     use.ingrowth = TRUE,
                     ingrowth.min.dbh = 3.0,
                     ingrowth.thrshld = 0,
-                    use.vol = FALSE) {
+                    use.vol = FALSE,
+                    use.hier.ingrowth = FALSE,   # v13.1 SWITCH A (default OFF => v12.11 flat ingrowth path)
+                    use.hier.mortality = FALSE,  # v13.1 SWITCH B (default OFF => v12.11 mortality path)
+                    hier.postdir = '~/v13_kickoff') {  # runtime posterior directory (point at ~/v13_subplot for subplot grain)
   
   # Convert strings to logical-- in case someone redefines TRUE and FALSE 
   char_to_logical = function(x) {
@@ -3071,9 +3239,13 @@ make_ops = function(verbose = FALSE,
                    use.ingrowth = char_to_logical(use.ingrowth),
                    ingrowth.min.dbh = ingrowth.min.dbh,
                    ingrowth.thrshld = ingrowth.thrshld,
-                   use.vol=use.vol) %>%
+                   use.vol=use.vol,
+                   use.hier.ingrowth = char_to_logical(use.hier.ingrowth),
+                   use.hier.mortality = char_to_logical(use.hier.mortality),
+                   hier.postdir = as.character(hier.postdir)) %>%
     dplyr::mutate(dplyr::across(c(verbose, use.cap.dbh, use.cap.ht, use.sbw.mod,
-                                  use.thin.mod, use.hw.mod, use.mgmt.mod, use.ingrowth),
+                                  use.thin.mod, use.hw.mod, use.mgmt.mod, use.ingrowth,
+                                  use.hier.ingrowth, use.hier.mortality),
                                 as.logical),
                   dplyr::across(c(sbw.cdef, sbw.yr, sbw.dur, thin.ba.perc.rmv,
                                   thin.ba.pre, thin.qmd.ratio, thin.year,
@@ -3854,13 +4026,56 @@ AcadianGYOneStand = function(tree, stand, ops)
     .mds_k      = tryCatch(if (!is.null(ops$mort.dens.k)      && !is.na(ops$mort.dens.k))      ops$mort.dens.k      else 12.4, error=function(e) 12.4)
     .mds_rd0    = tryCatch(if (!is.null(ops$mort.dens.rd0)    && !is.na(ops$mort.dens.rd0))    ops$mort.dens.rd0    else 0.38, error=function(e) 0.38)
     .mds_sdimax = tryCatch(if (!is.null(ops$mort.dens.sdimax) && !is.na(ops$mort.dens.sdimax)) ops$mort.dens.sdimax else 1200, error=function(e) 1200)
+
+    # v13.1 SWITCH B (mortality): the management-FREE hierarchical cloglog mortality posterior
+    # REPLACES the v12.11 management-gated attenuation. Gated ops$use.hier.mortality (default OFF =>
+    # mort_hier_g is exactly 1.0 for every plot, so the sdm_mfrac line below is unchanged and the
+    # build stays byte-identical to frozen v12.10.1). When ON, the posterior enters at the SAME point
+    # the v12.11 management gate sat, as a management-free multiplicative hazard modifier
+    #   g = exp( b_rd*z(rd) + b_lnqmd*z(ln qmd) + b_ba*z(ba) + u_region + u_region:eco + u_fortype ),
+    # i.e. the fitted cloglog hazard-rate ratio relative to the mean-covariate, population-level
+    # reference (intercept and log_years offset cancel, so g = 1 at the reference stand). The
+    # frozen-base self-thinning ramp (onset/break/beta) is preserved, so Reineke and the density
+    # plateau are untouched; only the managed-stand attenuation is replaced by the fitted hazard plus
+    # the crossed random effects. This is the structure that addresses the two v12.11 managed flags,
+    # the QC volume over-correction and the SILC basal-area widening, both of which traced to the
+    # hand-tuned management gate. Recommended config: use.hier.mortality ON with ops$mort.dens.scale
+    # OFF, so the v12.11 gate factor is 1 and only the posterior modifier applies. Covariates are per
+    # plot: rd = SDI/SDImax, ba (m2/ha) and qmd (cm) from the post-growth tree list; standardized with
+    # the saved v131r_mortB_scaling.csv. Read at runtime from ops$hier.postdir.
+    .mh_on = tryCatch(if (!is.null(ops$use.hier.mortality)) isTRUE(ops$use.hier.mortality) else FALSE, error=function(e) FALSE)
+    if (.mh_on) {
+      .pdir_m = tryCatch(if (!is.null(ops$hier.postdir) && !is.na(ops$hier.postdir)) as.character(ops$hier.postdir) else '~/v13_kickoff', error=function(e) '~/v13_kickoff')
+      .Pm   = .acd_hier_load(.pdir_m, 'mortality')
+      .grpm = .acd_hier_groups(ops)
+      .mort_hier_tab = tree %>%
+        dplyr::left_join(dplyr::transmute(plot.smry, plot, .mh_sdimax = sdi.max), by = 'plot') %>%
+        dplyr::group_by(plot) %>%
+        dplyr::summarise(.mh_sdi    = sum(ifelse(dbh >= 10, (dbh / 25.4)^1.6 * expf, 0), na.rm = TRUE),
+                         .mh_sdimax = dplyr::first(.mh_sdimax),
+                         .mh_ba     = sum(pi * dbh^2 / 40000 * expf, na.rm = TRUE),
+                         .mh_expf   = sum(expf, na.rm = TRUE),
+                         .mh_d2e    = sum(dbh^2 * expf, na.rm = TRUE),
+                         .groups = 'drop') %>%
+        dplyr::mutate(.mh_rd  = ifelse(!is.na(.mh_sdimax) & .mh_sdimax > 0, .mh_sdi / .mh_sdimax, 0),
+                      .mh_qmd = ifelse(.mh_expf > 0, sqrt(.mh_d2e / .mh_expf), 0),
+                      mort_hier_g = exp(.acd_hier_eta_dev(.Pm, rd = .mh_rd, qmd = .mh_qmd, ba = .mh_ba,
+                                                          region = .grpm$region, eco = .grpm$eco, fortype = .grpm$fortype)),
+                      mort_hier_g = ifelse(is.finite(mort_hier_g), pmax(mort_hier_g, 0), 1)) %>%
+        dplyr::select(plot, mort_hier_g)
+    } else {
+      .mort_hier_tab = dplyr::distinct(dplyr::select(tree, plot))
+      .mort_hier_tab$mort_hier_g = 1.0                 # exact no-op multiplier => byte-identical gate-off
+    }
+
     tree = tree %>%
       dplyr::left_join(dplyr::transmute(plot.smry, plot, sdm_sdimax = sdi.max), by = 'plot') %>%
+      dplyr::left_join(.mort_hier_tab, by = 'plot') %>%
       dplyr::group_by(plot) %>%
       dplyr::mutate(sdm_sdi   = sum(ifelse(dbh >= 10, (dbh / 25.4)^1.6 * expf, 0), na.rm = TRUE),
                     sdm_rd    = ifelse(!is.na(sdm_sdimax) & sdm_sdimax > 0, sdm_sdi / sdm_sdimax, 0),
                     sdm_mfrac = .sdm_bg * pmin(pmax(sdm_rd - .sdm_onset, 0), .sdm_break - .sdm_onset) + .sdm_bs * pmax(sdm_rd - .sdm_break, 0),
-                    sdm_mfrac = sdm_mfrac * (if (.mds_on && .mds_managed) (.mds_fmin + (1 - .mds_fmin) * exp(-.mds_k * pmax(sdm_sdi / .mds_sdimax - .mds_rd0, 0))) else 1),
+                    sdm_mfrac = sdm_mfrac * (if (.mds_on && .mds_managed) (.mds_fmin + (1 - .mds_fmin) * exp(-.mds_k * pmax(sdm_sdi / .mds_sdimax - .mds_rd0, 0))) else 1) * mort_hier_g,
                     sdm_keepi = ifelse(sdm_rd > .sdm_onset, pmax(0, 1 - sdm_mfrac), 1),
                     sdm_keepc = ifelse(sdm_rd * sdm_keepi > .sdm_max & sdm_rd > 0, .sdm_max / (sdm_rd * sdm_keepi), 1),
                     sdm_keepi = pmax(0, pmin(1, sdm_keepi)),
@@ -3868,7 +4083,7 @@ AcadianGYOneStand = function(tree, stand, ops)
                     expf      = expf * sdm_keepi * sdm_keepc,
                     expf      = ifelse(expf < 0.00001, 0.00001, expf)) %>%
       dplyr::ungroup() %>%
-      dplyr::select(-sdm_sdimax, -sdm_sdi, -sdm_rd, -sdm_mfrac, -sdm_keepi, -sdm_keepc)
+      dplyr::select(-sdm_sdimax, -sdm_sdi, -sdm_rd, -sdm_mfrac, -sdm_keepi, -sdm_keepc, -mort_hier_g)
   }
   
   # ---- #126b size-dependent survivor mortality correction (opt-in) --------
