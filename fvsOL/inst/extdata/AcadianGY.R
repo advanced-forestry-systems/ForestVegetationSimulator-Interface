@@ -14,7 +14,7 @@
 library(dplyr) # needed arrange, mutate, left_join, tibble, select, group_by, summarise, ungroup, case_when, all_of
 library(purrr) # needed for pmap_*
 
-AcadianVersionTag = "AcadianV13.2"
+AcadianVersionTag = "AcadianV13.3"
 
 # ---------------------------------------------------------------------------
 # v13.1 (DRAFT) hierarchical recruitment and mortality: the fitted posteriors REPLACE
@@ -180,6 +180,54 @@ AcadianVersionTag = "AcadianV13.2"
   list(region = g('hier.region'), eco = g('hier.eco'), fortype = g('hier.fortype'))
 }
 # ==== end v13.1 hierarchical posterior runtime loader ====
+
+# ---------------------------------------------------------------------------
+# 13.3 (DRAFT) hardwood form/risk GAP-FILL: AB and WA diameter growth, SM survival investigated.
+#   AMENDMENT 27 August 2026: SM survival is NOW CARRIED, by tsurv_hw_mod_fia (M =
+#   clamp(S_ref^(HR-1), 0.60, 1.00), cloglog hazard-ratio form fit on the Maine FIA GRM
+#   crosswalk, n = 15,881), wired behind ops$use.hw.surv.fia, a NEW sub-flag nested under
+#   ops$use.hw.mod and defaulting to FALSE, so behaviour with use.hw.mod alone is unchanged and
+#   the AB/WA isolation property of the two-arm benchmark is preserved. The SM survival
+#   paragraphs below record why the Castle-form tsurv.hw.spp table could NOT carry SM and remain
+#   true; the new modifier is a different object on a different scale (see tsurv_hw_mod_fia's
+#   own comment and results/formrisk_fia/2026-08-26_sm_survival_refit_DRAFT.md).
+#   Same lever as v12.11's ddbh_hw_mod / tsurv_hw_mod (ops$use.hw.mod, default OFF => byte-identical
+#   to baseline), extended to cover species the six-species Castle (2018) fit never included. Not a
+#   new flag; a coverage extension of the existing one, per Aaron's explicit "fill gaps only" call
+#   26 August 2026: touch nothing already validated for RO/SM/YB/RM/PB/QA growth or QA/RM/RO/YB/PB
+#   survival, and leave Lever 4 (dht_hw_mod, height) untouched.
+#
+#   GROWTH (American beech AB, white ash WA). ddbh_hw_mod's six-species modifier is a ratio in which
+#   every species-shared term, including spp.coeff and dbh.interaction, cancels algebraically, so it
+#   is provably identical across species and could never be extended to AB/WA by adding rows to
+#   ddbh.hw.mod.spp (see the comment on that table, and results/formrisk_fia/
+#   2026-08-26_fia_crosswalk_formrisk_modifiers_DRAFT.md). AB and WA instead get a new, non-cancelling
+#   formula (ddbh_hw_mod_fia, coefficients in ddbh.hw.mod.fia.spp) fit 26 August 2026 from the Maine
+#   FIA GRM form/risk crosswalk: ANN_DIA_GROWTH ~ SP*form_begin + SP*risk_begin + log(DIA_BEGIN) +
+#   (1|PLT_CN), Gamma/log link, glmmTMB, n=134,449, RM reference (growth_model_coefficients_2026-08-
+#   26.csv). Deliberately keeps the native 3-level risk (R1/R2/R3) rather than collapsing to Castle's
+#   LR/HR, since R2 and R3 carry meaningfully different coefficients for both species; form is
+#   collapsed to F1/F2 exactly as ddbh_hw_mod already does, since that crosswalk was itself built to
+#   match that same collapse. AB's form and risk-R2 terms are not individually significant in the
+#   species interaction (disclosed in the coefficient comments, not suppressed); AB's risk-R3 term and
+#   all three of WA's terms are significant. This is a DIAMETER growth finding only. It says nothing
+#   about AB's HEIGHT growth, which Lever 4 (dht_hw_mod) deliberately excludes AB from for the
+#   opposite reason, its height growth moves the other way; the two are unrelated results about two
+#   different responses, not a contradiction.
+#
+#   SURVIVAL (sugar maple SM, investigated and NOT added). SM has carried no survival modifier since
+#   v12.3.2. tsurv_hw_mod's ratio needs per-tree BAL, per-plot ba.plot, and a 3-level NHRI form split
+#   (STM/SWP/MST/OTHER) alongside a species b0/b1 pair; the FIA GRM population used to fit the new
+#   mortality model has none of the three (no BAL or plot BA field, and reconstructing them would
+#   need FIA adjustment factors this extract does not carry and would undercount competitors on any
+#   plot with a harvested tree, since the population is restricted to SURVIVOR/MORTALITY1/MORTALITY2
+#   records; only a 2-level form_begin, not the STM/SWP/MST split the shared equation needs). The new
+#   mortality fit is also cloglog with a REMPER offset against an RM reference, not the untransformed
+#   logistic-on-DBH ratio against a PB reference this table uses, so its SM coefficients are not on a
+#   convertible scale either. Judged not fittable cleanly in the same functional form as the existing
+#   five rows; reported here rather than forced (see the comment at the tsurv_hw_mod call site). SM
+#   remains excluded from the survival species gate, unchanged from v12.3.2.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # 12.11 (maturity-gradient long-horizon volume correction; three gated levers, default OFF
@@ -973,6 +1021,12 @@ ddbh.spp = tibble::tribble(
   'OS',      0.0,                0.0,                    0.0,                  0.0)
 
 # Hardwood form and risk modifier species parameters
+# v13.3 (DRAFT): AB and WA rows are present so match() finds an explicit entry instead of silently
+# falling through to the PB nomatch fallback, but their values are NA and UNUSED. The ratio formula
+# below cancels spp.coeff and dbh.interaction identically for every species (every shared term
+# appears in both numerator and denominator), so no value placed here could ever produce an AB- or
+# WA-specific effect. AB and WA are gated to a separate, non-cancelling formula instead
+# (ddbh_hw_mod_fia / ddbh.hw.mod.fia.spp, defined just below ddbh_hw_mod).
 ddbh.hw.mod.spp = tibble::tribble(
   ~species, ~spp.coeff, ~dbh.interaction,
   'RO', -0.3453, 0.0511,
@@ -980,7 +1034,9 @@ ddbh.hw.mod.spp = tibble::tribble(
   'YB', -0.2494, 0.0251,
   'RM', -0.6377, 0.0477,
   'QA', -0.1059, 0.0476,
-  'PB', 0.0, 0.0)       # reference species
+  'PB', 0.0, 0.0,        # reference species
+  'AB', NA_real_, NA_real_,   # unused placeholder, see comment above
+  'WA', NA_real_, NA_real_)   # unused placeholder, see comment above
 
 # SBW modifier region and species parameters
 ddbh.sbw.region = tibble::tribble(
@@ -1052,14 +1108,24 @@ ddbh = function(dbh, cr, bal.sw, bal.hw, csi, ddbh.b0.spp, ddbh.b2.spp, ddbh.b3.
 #' @param dbh.interaction Numeric: DBH interaction coefficient
 #' @return Numeric: Modifier value
 ddbh_hw_mod = function(sp, dbh, bal, form, risk, spp.coeff, dbh.interaction) {
-  
+
   # Check for valid species, form and risk codes
+  # v13.3 (DRAFT): AB, WA added to the gate (gap-fill; see changelog and ddbh_hw_mod_fia below).
   if (is.na(form) | !(gsub('[^0-9]', '', form) %in% 1:8) |
       is.na(risk) | !(gsub('[^0-9]', '', risk) %in% 1:4) |
-      !sp %in% c('RO', 'SM', 'YB', 'RM', 'PB', 'QA')) {
+      !sp %in% c('RO', 'SM', 'YB', 'RM', 'PB', 'QA', 'AB', 'WA')) {
     return(1)
   }
-  
+
+  # v13.3 (DRAFT): AB and WA dispatch to the FIA-crosswalk fit. The six-species code below this
+  # branch cannot be reused unmodified for them: every species-shared term (including spp.coeff and
+  # dbh.interaction) cancels algebraically in that ratio, so it is provably identical across species
+  # and could never carry an AB- or WA-specific effect (see the analysis writeup and the comment on
+  # ddbh.hw.mod.spp above). RO/SM/YB/RM/PB/QA are completely untouched below.
+  if (sp %in% c('AB', 'WA')) {
+    return(ddbh_hw_mod_fia(sp = sp, form = form, risk = risk))
+  }
+
   # Convert NHRI form classes
   new.form = ifelse(form %in% c('F1', 'F7', 'F3', 'F4'), 'A', 'B')
   
@@ -1080,6 +1146,79 @@ ddbh_hw_mod = function(sp, dbh, bal, form, risk, spp.coeff, dbh.interaction) {
                      spp.coeff + dbh.interaction * dbh + 0.2176))
   
   ddbh.hw.mod
+}
+
+# v13.3 (DRAFT): AB/WA hardwood form and risk GROWTH gap-fill (FIA-crosswalk fit, 26 August 2026).
+# Component fixed-effect terms read directly from growth_model_coefficients_2026-08-26.csv in
+# results/formrisk_fia/ (verify against that file before changing anything below). Composition rule:
+# a species' total form/risk log-effect = the pooled main term + that species' own interaction term,
+# regardless of whether either term alone is significant (that is how the interaction is coded
+# relative to the RM reference level). See results/formrisk_fia/
+# 2026-08-26_fia_crosswalk_formrisk_modifiers_DRAFT.md for the full model and discussion.
+.v133_g_form2   = -0.00422106456557921   # form_beginF2 (pooled term), p=0.112 (not significant)
+.v133_g_riskR2  = -0.00982139471041097   # risk_beginR2 (pooled term), p<0.001
+.v133_g_riskR3  = -0.0193967010575448    # risk_beginR3 (pooled term), p<0.001
+.v133_g_AB_form2  = -0.00188874457553597 # SPAB:form_beginF2, p=0.686 (NOT significant)
+.v133_g_AB_riskR2 = -0.00304825651968753 # SPAB:risk_beginR2, p=0.486 (NOT significant)
+.v133_g_AB_riskR3 = -0.0414132479499148  # SPAB:risk_beginR3, p=0.000352 (significant)
+.v133_g_WA_form2  =  0.02126917603259    # SPWA:form_beginF2, p=0.046 (significant)
+.v133_g_WA_riskR2 =  0.0634553237386358  # SPWA:risk_beginR2, p<0.001 (significant)
+.v133_g_WA_riskR3 =  0.080089968954636   # SPWA:risk_beginR3, p=0.029 (significant)
+
+# Total log-effect per species = pooled term + species interaction term (composition rule above).
+# AB form_F2 total: -0.00611 (neither component individually significant, disclosed not suppressed).
+# AB risk_R2 total: -0.01287 (not significant). AB risk_R3 total: -0.06081 (significant).
+# WA form_F2 total: +0.01705 (significant). WA risk_R2 total: +0.05364 (significant).
+# WA risk_R3 total: +0.06069 (significant).
+ddbh.hw.mod.fia.spp = tibble::tribble(
+  ~species, ~coef.form2, ~coef.risk2, ~coef.risk3,
+  'AB', .v133_g_form2 + .v133_g_AB_form2, .v133_g_riskR2 + .v133_g_AB_riskR2, .v133_g_riskR3 + .v133_g_AB_riskR3,
+  'WA', .v133_g_form2 + .v133_g_WA_form2, .v133_g_riskR2 + .v133_g_WA_riskR2, .v133_g_riskR3 + .v133_g_WA_riskR3)
+
+#' v13.3 (DRAFT): AB/WA hardwood form and risk GROWTH modifier (FIA-crosswalk fit)
+#'
+#' Multiplicative modifier on ddbh, normalized to 1 at the reference cell (form F1, risk R1), for
+#' American beech (AB) and white ash (WA), the two species Castle/Smith's ddbh_hw_mod (six species
+#' RO/SM/YB/RM/PB/QA) has NO modifier for (returns 1 always; see the comment on ddbh.hw.mod.spp for
+#' why that six-species ratio cannot be extended to them). Coefficients fit 26 August 2026 from the
+#' Maine FIA GRM form/risk crosswalk (glmmTMB Gamma/log growth model, RM reference, n=134,449); see
+#' results/formrisk_fia/2026-08-26_fia_crosswalk_formrisk_modifiers_DRAFT.md. Deliberately keeps the
+#' native 3-level risk (R1/R2/R3) rather than collapsing to Castle's LR/HR, since the new fit's R2 and
+#' R3 coefficients differ meaningfully for both species; R4 (rare, and not resolvable from the FIA
+#' TREECLCD/CULL_FLD source that fit these coefficients) is folded into the R3 bucket, mirroring how
+#' the crosswalk itself treats FIA's coarsest risk call (rotten cull) as its worst class. Form is
+#' collapsed exactly as ddbh_hw_mod already does (A={F1,F3,F4,F7} -> reference F1; else -> F2), since
+#' the FIA crosswalk that produced these coefficients was itself built to align with that collapse.
+#' AB's form and risk-R2 terms are NOT individually significant in the species interaction (see the
+#' coefficient comments above); disclosed rather than suppressed. Clamped to [0.5, 1.2] as a sanity
+#' bound, matching Lever 4's dht_hw_mod convention; in practice these effects are small (< 7 percent)
+#' and never approach the clamp. This is a DIAMETER growth modifier only; it says nothing about AB's
+#' HEIGHT growth, which Lever 4's dht_hw_mod deliberately excludes AB from for the opposite reason
+#' (its height growth moves the other way) -- unrelated findings about two different responses.
+#'
+#' @param sp Character: Species code ('AB' or 'WA')
+#' @param form Character: Form class (native NHRI code, e.g. F1-F8, as already used by ddbh_hw_mod)
+#' @param risk Character: Risk class (native NHRI code, e.g. R1-R4, as already used by ddbh_hw_mod)
+#' @return Numeric: Modifier value, clamped to [0.5, 1.2]
+ddbh_hw_mod_fia = function(sp, form, risk) {
+
+  idx = match(sp, ddbh.hw.mod.fia.spp$species)
+  if (is.na(idx)) return(1)
+
+  # Form: same A/F1 (ideal) vs B/F2 (else) collapse ddbh_hw_mod already uses for the six-species case.
+  form2 = ifelse(form %in% c('F1', 'F7', 'F3', 'F4'), 0, 1)
+
+  # Risk: native 3-level R1/R2/R3, NOT collapsed to LR/HR (see roxygen note above). R4 folds into R3.
+  risk2 = ifelse(risk %in% c('R2'), 1, 0)
+  risk3 = ifelse(risk %in% c('R3', 'R4'), 1, 0)
+
+  mod = exp(ddbh.hw.mod.fia.spp$coef.form2[idx] * form2 +
+            ddbh.hw.mod.fia.spp$coef.risk2[idx] * risk2 +
+            ddbh.hw.mod.fia.spp$coef.risk3[idx] * risk3)
+
+  mod = pmax(0.5, pmin(1.2, mod))
+
+  mod
 }
 
 # Post-thinning diameter increment modifier  
@@ -2309,6 +2448,52 @@ tsurv_hw_mod = function(dbh, bal, ba.plot, form, b0, b1) {
   tsurv_hw_mod(dbh = dbh, bal = bal, ba.plot = ba.plot, form = form, b0 = b0, b1 = b1)
 }
 
+# Sugar maple survival modifier from the Maine FIA GRM form and risk crosswalk, 27 August 2026.
+# Source fit: results/formrisk_fia/2026-08-26_sm_survival_refit_DRAFT.md and
+# sm_main_effect_hr_2026-08-26.csv (binomial cloglog hazard, log(REMPER) offset, plot random
+# intercept, n = 15,881 Maine FIA sugar maple rows, AIC-selected, validity screen clean on all
+# five monotonicity tests, 600-resample plot-cluster bootstrap intervals). On the cloglog scale
+# a form and risk contrast multiplies the annual hazard by a constant HR, so with S_ref the
+# annual survival the engine would otherwise assign the tree (surv.tree), modified survival is
+# S_ref^HR exactly and the multiplicative modifier is
+#   M = clamp( S_ref^(HR - 1), 0.60, 1.00 ),
+# equal to 1 at good form and low risk by construction. HR is the product of two main effects
+# (no interaction retained by AIC):
+#   form  F2 vs F1: 1.97893813132547
+#   risk  R2 vs R1: 2.76231530263085,  R3 vs R1: 8.0231672229822
+# giving the six-cell table 1.000 / 2.762 / 8.023 (F1) and 1.979 / 5.466 / 15.877 (F2). The
+# ceiling of 1.00 cannot bind on a correctly coded tree (every cell's bootstrap lower HR bound
+# exceeds 1, smallest 1.426 at F2/R1) and the floor of 0.60 is an extrapolation guard only,
+# verified inactive on all 15,881 fitted trees (raw in-sample minimum 0.7480). Form and risk
+# enter on the FIA crosswalk's own 2-level x 3-level scale, reached from the engine's NHRI codes
+# by the same collapse ddbh_hw_mod_fia already uses: NHRI F1/F3/F4/F7 -> crosswalk F1, all else
+# F2; NHRI R4 folds into crosswalk R3. That mapping is an assumption carried over rather than a
+# measurement (the write-up names it the weakest link in the chain). NOT comparable to
+# tsurv_hw_mod and NOT expressible as a sixth tsurv.hw.spp row: different response scale
+# (cloglog hazard vs logistic-on-DBH ratio), different reference (the engine's own surv.tree vs
+# a PB-referenced fixed baseline), and a value that moves with any recalibration of the survival
+# equation, which is why it cannot be tabulated as a b0/b1 pair. SCALAR function; apply
+# element-wise (purrr::pmap_dbl) per the 27 August 2026 vectorization lesson.
+tsurv_hw_mod_fia = function(sp, form, risk, surv.tree) {
+
+  # Valid species, form, risk and reference survival, else no modification
+  if (is.na(sp) || sp != 'SM' ||
+      is.na(form) || !(gsub('[^0-9]', '', form) %in% 1:8) ||
+      is.na(risk) || !(gsub('[^0-9]', '', risk) %in% 1:4) ||
+      is.na(surv.tree) || surv.tree <= 0 || surv.tree > 1) {
+    return(1)
+  }
+
+  # NHRI -> crosswalk collapse, identical to ddbh_hw_mod_fia's
+  hr.form = ifelse(form %in% c('F1', 'F7', 'F3', 'F4'), 1, 1.97893813132547)
+  hr.risk = ifelse(risk %in% c('R3', 'R4'), 8.0231672229822,
+                   ifelse(risk %in% c('R2'), 2.76231530263085, 1))
+
+  # Annual hazard ratio and clamped multiplicative survival modifier
+  hr = hr.form * hr.risk
+  max(0.60, min(1.00, surv.tree^(hr - 1)))
+}
+
 #' Plot thinning survival modifier
 #' 
 #' @param year.thin Numeric: Commercial thinning year
@@ -2535,6 +2720,25 @@ calc_mortality = function(tree.data, plot.data, region = stand$region,
   
   
   # Hardwood form and risk modifier
+  # v13.3 (DRAFT): sugar maple (SM) was investigated for this coverage gap (SM has carried no
+  # survival modifier since v12.3.2, per the 12.3.2 changelog entry) and NOT added. tsurv_hw_mod's
+  # shared ratio needs per-tree BAL, per-plot ba.plot, and a 3-level NHRI form split
+  # (STM/SWP/MST/OTHER) alongside the species b0/b1 pair; the FIA GRM crosswalk population used to
+  # fit the new mortality model (grm_formrisk_analysis_population_2026-08-26.csv, on Cardinal) has
+  # none of the three: no BAL or plot BA field at all (reconstructing either would need FIA
+  # population adjustment factors this extract does not carry, and would undercount competitors on
+  # any plot with a harvested tree, since the population is restricted to SURVIVOR/MORTALITY1/
+  # MORTALITY2 records), and only a 2-level form_begin (F1/F2), not the STM/SWP/MST split the shared
+  # equation needs. The new mortality fit is also a cloglog hazard with a REMPER offset against an RM
+  # reference, not the untransformed logistic-on-DBH ratio against a PB reference this table uses, so
+  # its SM coefficients are not on a convertible scale either. Judged not fittable cleanly in the same
+  # functional form as the existing five rows (RO/YB/RM/PB/QA, all untouched below); reported here
+  # rather than forced. SM remains excluded from the species gate immediately below.
+  # AMENDMENT 27 August 2026: SM survival is now carried INSTEAD by tsurv_hw_mod_fia,
+  # gated separately behind ops$use.hw.surv.fia and applied after surv.tree is computed,
+  # further below. The exclusion from THIS gate stands, and must stand, since the two
+  # objects are on different scales and a sixth tsurv.hw.spp row cannot express the new
+  # modifier (it takes surv.tree as an argument).
   if (use.hw.mod == TRUE) {
     tree = tree %>%
       dplyr::left_join(tsurv.hw.spp, 
@@ -2578,11 +2782,30 @@ calc_mortality = function(tree.data, plot.data, region = stand$region,
                   b2 = tree.mort.spp$b2[mort.idx],
                   surv.tree = tree_surv_prob(sp, dbh, b0, b1, b2)) %>%
     dplyr::select(-mort.idx, -b0, -b1, -b2)
+
+  # Sugar maple FIA survival modifier (tsurv_hw_mod_fia, defined above). Gated behind
+  # ops$use.hw.surv.fia, a sub-flag NESTED UNDER use.hw.mod: BOTH must be TRUE, and the new flag
+  # defaults to FALSE (a missing ops entry reads NULL, and isTRUE(NULL) is FALSE), so the engine
+  # is byte-identical to committed v13.3 out of the box and under use.hw.mod alone. Deliberately
+  # NOT folded under use.hw.mod by itself: that would break the AB/WA benchmark isolation
+  # property, namely that every source carrying no AB, WA or SM scores identically between the
+  # two arms. Applied AFTER surv.tree is computed because the modifier is a function of the
+  # engine's own reference survival rather than of a fixed baseline. Scalar function applied
+  # element-wise with pmap_dbl; its internal validity gate returns 1 for every non-SM row, every
+  # NA or invalid form or risk code, and any out-of-range reference survival.
+  if (use.hw.mod == TRUE && isTRUE(ops$use.hw.surv.fia)) {
+    tree = tree %>%
+      dplyr::mutate(tsurv.hw.fia.mod = purrr::pmap_dbl(list(sp, form, risk, surv.tree),
+                                                       tsurv_hw_mod_fia))
+  } else {
+    tree = tree %>%
+      dplyr::mutate(tsurv.hw.fia.mod = 1)
+  }
   
   # Apply tree level mortality modifiers
   tree = tree %>%
     dplyr::mutate(tsurv = pmax(0, pmin(surv.tree *
-                                         tsurv.thin.mod * tsurv.sbw.mod * tsurv.hw.mod, 
+                                         tsurv.thin.mod * tsurv.sbw.mod * tsurv.hw.mod * tsurv.hw.fia.mod, 
                                        1.0)),
                   tmort = 1-tsurv)
   
