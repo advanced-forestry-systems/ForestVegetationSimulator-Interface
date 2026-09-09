@@ -14,7 +14,7 @@
 library(dplyr) # needed arrange, mutate, left_join, tibble, select, group_by, summarise, ungroup, case_when, all_of
 library(purrr) # needed for pmap_*
 
-AcadianVersionTag = "AcadianV13.1"
+AcadianVersionTag = "AcadianV13.2"
 
 # ---------------------------------------------------------------------------
 # v13.1 (DRAFT) hierarchical recruitment and mortality: the fitted posteriors REPLACE
@@ -24,13 +24,18 @@ AcadianVersionTag = "AcadianV13.1"
 #   The v12.11 levers, their env-var wiring, and make_ops are all preserved unchanged; the two
 #   v13.1 switches are added alongside them.
 #
-#   SWITCH A  ops$use.hier.ingrowth (default FALSE). When TRUE, stand recruitment is set from the
+#   SWITCH A  ops$use.hier.ingrowth (default FALSE). When TRUE, stand recruitment is MODIFIED by the
 #     converged hierarchical negbinomial (log link) ingrowth posterior (Cardinal job 12470707 v5)
-#     INSTEAD of the v12.11 flat ops$ingrowth.mult (about 2.5x). Predicted recruits per ha per year
-#     = exp( b0 + b_rd*z(rd) + b_lnqmd*z(ln qmd) + b_ba*z(ba) + u_region + u_eco + u_fortype ),
-#     with z() the saved training standardization (v131r_scaling.csv) and the log_years offset = 0
-#     at the engine's 1-year cycle. It carries the fitted density and composition dependence (QMD
-#     down, BA up) the flat multiplier could not.
+#     INSTEAD of the v12.11 flat ops$ingrowth.mult (about 2.5x). The posterior enters as a MULTIPLICATIVE
+#     density/composition modifier on the engine's native ingrowth.ph:
+#       ingrowth.ph <- ingrowth.ph * exp( b_rd*z(rd) + b_lnqmd*z(ln qmd) + b_ba*z(ba) + u_region + u_eco + u_fortype )
+#     with z() the saved training standardization (v131r_scaling.csv). The intercept b0 and the log_years
+#     offset are EXCLUDED so the modifier equals 1.0 at training-mean covariates: this keeps the engine's
+#     calibrated magnitude and adds only the fitted density and composition dependence (QMD down, BA up)
+#     the flat multiplier could not carry. Rationale (2026-07-25 fix): exp(b0) is on the FIA microplot
+#     recruit_tph basis (~51 recruits/ha/yr), ~4x the engine's native ~13, so the original ABSOLUTE
+#     replacement exp(b0 + eta_dev) inflated PEF ingrowth ~14x (13.4 -> 186.4). Mirrors SWITCH B, which
+#     also enters as a multiplicative modifier rather than an absolute replacement.
 #
 #   SWITCH B  ops$use.hier.mortality (default FALSE). When TRUE, the annual mortality hazard is set
 #     from the management-FREE hierarchical binomial (cloglog link) mortality posterior (job 12526556
@@ -81,6 +86,7 @@ AcadianVersionTag = "AcadianV13.1"
   vc = .acd_read_csv(file.path(postdir, paste0(prefix, '_varcomp.csv')))   # loaded for structure/SD
   sc = .acd_read_csv(file.path(postdir, scalef))
   rf = .acd_read_csv(file.path(postdir, paste0(prefix, '_ranef.csv')))      # OPTIONAL
+  nz = .acd_read_csv(file.path(postdir, paste0(prefix, '_norm.csv')))       # OPTIONAL (v13.1 aggregate-neutrality normalizer)
 
   if (is.null(fx) || is.null(sc))
     stop("v13.1 hierarchical ", which, " posterior not found under '", postdir,
@@ -104,8 +110,28 @@ AcadianVersionTag = "AcadianV13.1"
   ssd  = suppressWarnings(as.numeric(sc[['sd']]))
   gsc  = function(v, what) { i = which(svar == v)[1]; if (is.na(i)) NA_real_ else (if (what == 'mean') smu[i] else ssd[i]) }
 
+  # v13.1 AGGREGATE-NEUTRALITY (Jensen) NORMALIZER N, added 2026-07-28.
+  # A log-link modifier centred on the training-mean covariate is POINTWISE 1.0 but is NOT
+  # population-mean 1.0: E[exp(eta_dev)] = exp(sigma^2/2) > 1. N is the measured mean of
+  # exp(eta_dev) over the FITTING rows, computed once offline by ~/v131r_ing3_norm.R and shipped
+  # beside the posterior as <prefix>_norm.csv (rows var,value; the row var == 'norm' holds N).
+  # N is a property of the POSTERIOR and the TRAINING population only. It is read here, memoized
+  # with the rest of the posterior, and is NEVER recomputed from the stands being projected, so
+  # predictions cannot depend on which plots happen to be in a projection set.
+  # Missing file or unusable value => 1, i.e. the previous unnormalized behaviour.
+  nrm = 1
+  if (!is.null(nz) && ncol(nz) >= 2) {
+    nkey  = trimws(as.character(nz[[1]]))
+    nvcol = if ('value' %in% names(nz)) 'value' else names(nz)[[2]]
+    ni    = which(nkey %in% c('norm', 'N', 'normalizer'))[1]
+    if (!is.na(ni)) {
+      nv = suppressWarnings(as.numeric(nz[[nvcol]][ni]))
+      if (length(nv) == 1 && is.finite(nv) && nv > 0) nrm = nv
+    }
+  }
+
   out = list(
-    which = which, postdir = postdir,
+    which = which, postdir = postdir, norm = nrm,
     b0 = b0, b_rd = b_rd, b_lnqmd = b_lnq, b_ba = b_ba,
     m_rd = gsc('rd', 'mean'),      s_rd = gsc('rd', 'sd'),
     m_lnqmd = gsc('ln_qmd', 'mean'), s_lnqmd = gsc('ln_qmd', 'sd'),
@@ -1281,11 +1307,25 @@ calc_ddbh = function(tree.data, plot.data, csi = stand$csi, region = stand$regio
       dplyr::mutate(idx.hw.mod = match(sp, ddbh.hw.mod.spp.df$species, nomatch = match('PB', ddbh.hw.mod.spp.df$species)),
                     hw.mod.spp.coeff = ddbh.hw.mod.spp.df$spp.coeff[idx.hw.mod],
                     hw.mod.dbh.interaction = ddbh.hw.mod.spp.df$dbh.interaction[idx.hw.mod])%>%
+      # VECTORIZATION FIX, 27 August 2026. ddbh_hw_mod is a SCALAR function whose leading
+      # validity gate is an `if`, so handing it whole columns raised "the condition has
+      # length > 1" under R >= 4.2 the moment a stand carried a tree with a non-NA form and
+      # risk, i.e. any hardwood. ifelse() evaluates its `yes` branch only when at least one
+      # element of the test is TRUE, so an all-softwood stand never triggered it and projected
+      # normally, while a stand with even one hardwood errored out of AcadianGYOneStand and was
+      # silently discarded by the benchmark runner's per-stand tryCatch. Applied element-wise
+      # with purrr::pmap_dbl, which is the convention this same file already uses for
+      # ddbh_thin_mod, ddbh_sbw_mod, dht_hw_mod, tsurv_sbw_mod and tsurv_hw_mod. This is a
+      # vectorization fix ONLY: ddbh_hw_mod's body is untouched and each row receives exactly
+      # the scalar arguments the original call intended, so no modifier's numerical behaviour
+      # changes. The outer ifelse gate is retained for readability and is redundant with
+      # ddbh_hw_mod's own is.na(form)/is.na(risk) gate, which returns 1 for those rows anyway.
       dplyr::mutate(ddbh.form.risk.mod = ifelse(!is.na(form) & !is.na(risk),
-                                                ddbh_hw_mod(sp = sp, dbh = dbh, bal = bal,
-                                                            form = form, risk = risk, 
-                                                            spp.coeff = hw.mod.spp.coeff, 
-                                                            dbh.interaction = hw.mod.dbh.interaction), 1))%>% 
+                                                purrr::pmap_dbl(list(sp = sp, dbh = dbh, bal = bal,
+                                                                     form = form, risk = risk,
+                                                                     spp.coeff = hw.mod.spp.coeff,
+                                                                     dbh.interaction = hw.mod.dbh.interaction),
+                                                                ddbh_hw_mod), 1))%>% 
       select( -idx.hw.mod, 
               -hw.mod.spp.coeff, -hw.mod.dbh.interaction)
   } else {
@@ -1602,6 +1642,37 @@ dht.hw.mod.spp = tibble::tribble(
   'QA',  0.0210,
   'PB',  0.0)
 
+# =============================================================================
+# Hook C (v13.1): Castle-refit hardwood height modifier (RO/RM/SM/YB, PB ref).
+# Gated by ops$use.dht.hw.mod.castle (default OFF => not reached; the v12.11
+# dht.hw.mod.spp table above stays the active path, so gate-off is byte-identical).
+# RE-ANCHOR table wired active (internally consistent, PB=0 base); PRIMARY table
+# retained for provenance. Source: Castle VOLUME_TREES_CLEAN, 2026-07-23.
+# =============================================================================
+base.risk.coeff.castle   <- -0.1380   # PB reference (FIA GRM proxy); PRIMARY base
+gamma.form.castle        <- -0.020    # pooled form_B, unchanged from v12.11
+# PRIMARY (Castle deficit vs FIA PB base; cross-source; retained, NOT active)
+dht.hw.mod.spp.castle <- data.frame(
+  species        = c("RO",   "RM",   "SM",   "YB",   "PB"),
+  spp.coeff.risk = c(0.1764, 0.1210, 0.0890, 0.0884, 0.0000),
+  stringsAsFactors = FALSE)
+# RE-ANCHOR (ACTIVE when gate ON: Castle-only, PB=0 base, internally consistent)
+base.risk.coeff.reanchor <- 0.0
+dht.hw.mod.spp.reanchor <- data.frame(
+  species        = c("RO",    "RM",    "SM",    "YB",    "PB"),
+  spp.coeff.risk = c(0.0384, -0.0170, -0.0490, -0.0496,  0.0000),
+  stringsAsFactors = FALSE)
+dht_hw_mod_castle = function(sp, dbh, form, risk, spp.coeff.risk,
+                             base.risk.coeff = base.risk.coeff.castle,
+                             gamma.form = gamma.form.castle) {
+  if (is.na(form) || is.na(risk) ||
+      !sp %in% c("RO", "SM", "YB", "RM", "PB", "QA")) return(1)
+  form.b = if (form %in% c("F1","F3","F4","F7")) 0 else 1
+  hr     = if (risk %in% c("R1","R2")) 0 else 1
+  m = exp(base.risk.coeff * hr + spp.coeff.risk * hr + gamma.form * form.b)
+  max(0.5, min(1.2, m))
+}
+
 #' Calculate height thinning modifier
 #' 
 #' @param sp Character: Species code (FVS alpha)
@@ -1774,7 +1845,20 @@ calc_dht = function(tree.data, plot.data, csi = stand$csi,
   # already exist on tree.data (consumed by calc_ddbh's ddbh_hw_mod); no new upstream plumbing. Uses
   # a separate flag from ops$use.hw.mod so the height correction ships and tests independently of the
   # diameter and mortality form/risk modifiers.
-  if (isTRUE(ops$use.dht.hw.mod)) {
+  if (isTRUE(ops$use.dht.hw.mod.castle)) {
+    # Hook C (v13.1): Castle-refit hardwood height modifier, RE-ANCHOR table active.
+    # Default OFF => this branch is not reached, so gate-off is byte-identical.
+    tree = tree %>%
+      dplyr::mutate(idx.hw.ht = match(sp, dht.hw.mod.spp.reanchor$species,
+                                      nomatch = match('PB', dht.hw.mod.spp.reanchor$species)),
+                    hw.ht.spp.coeff = dht.hw.mod.spp.reanchor$spp.coeff.risk[idx.hw.ht],
+                    dht.hw.mod = ifelse(!is.na(form) & !is.na(risk),
+                                        purrr::pmap_dbl(list(sp, dbh, form, risk, hw.ht.spp.coeff),
+                                                        function(.sp,.dbh,.form,.risk,.scr) dht_hw_mod_castle(.sp,.dbh,.form,.risk,.scr,
+                                                          base.risk.coeff = base.risk.coeff.reanchor, gamma.form = gamma.form.castle)),
+                                        1)) %>%
+      dplyr::select(-idx.hw.ht, -hw.ht.spp.coeff)
+  } else if (isTRUE(ops$use.dht.hw.mod)) {
     .dhthw_gform = tryCatch(if (!is.null(ops$dht.hw.gamma.form) && !is.na(ops$dht.hw.gamma.form)) ops$dht.hw.gamma.form else -0.020, error=function(e) -0.020)
     tree = tree %>%
       dplyr::mutate(idx.hw.ht = match(sp, dht.hw.mod.spp$species,
@@ -1829,13 +1913,22 @@ calc_dht = function(tree.data, plot.data, csi = stand$csi,
 #' @return Numeric: Height to crown base change (m)
 dhcb = function(dht, dbh, ht, hcb, ccf, shade) {
   
-  # Fixed parameter estimates
+  # Fixed parameter estimates (Hook D: gated recalibration ops$use.crhcb.recal, default OFF => frozen v12.10.1)
+  if (isTRUE(tryCatch(ops$use.crhcb.recal, error = function(e) FALSE))) {
+    b1 =  2.296521028
+    b2 = -0.364063448
+    b3 = -0.248653765
+    b4 =  0.126335922
+    b5 = -0.009227038
+    b6 =  0.432602995
+  } else {
   b1 = 4.000
   b2 = -0.8395
   b3 = -0.2196
   b4 = -0.3059
   b5 = -0.00553
   b6 = 0.09821 
+  }
   
   # Crown length and crown ratio
   cl = ht - hcb
@@ -2205,6 +2298,17 @@ tsurv_hw_mod = function(dbh, bal, ba.plot, form, b0, b1) {
   
 }
 
+# Call-site NA guard for tsurv_hw_mod (27 August 2026). tsurv_hw_mod's leading `if (form ==
+# 'F1')` is not NA-safe, and the mortality call site's ifelse() gate evaluates its `yes`
+# branch over every row, softwoods included, which carry form NA. This wrapper returns a
+# placeholder 1 for exactly the rows that gate discards, and delegates unchanged otherwise.
+# It adds NO numerical behaviour: every row the gate admits reaches tsurv_hw_mod with
+# byte-identical arguments.
+.tsurvhw_guard = function(dbh, bal, ba.plot, form, b0, b1) {
+  if (is.na(form) || is.na(b0)) return(1)
+  tsurv_hw_mod(dbh = dbh, bal = bal, ba.plot = ba.plot, form = form, b0 = b0, b1 = b1)
+}
+
 #' Plot thinning survival modifier
 #' 
 #' @param year.thin Numeric: Commercial thinning year
@@ -2435,9 +2539,23 @@ calc_mortality = function(tree.data, plot.data, region = stand$region,
     tree = tree %>%
       dplyr::left_join(tsurv.hw.spp, 
                        by = 'sp') %>%
+      # VECTORIZATION FIX (2), 27 August 2026. Companion to the calc_ddbh fix above, and only
+      # reachable once that one is in place, since calc_ddbh errored first and masked this.
+      # tsurv_hw_mod is already applied element-wise with purrr::pmap_dbl, yet ifelse()
+      # evaluates its `yes` branch over EVERY row, so the softwood rows the gate exists to
+      # exclude still reach the function, whose first statement is a bare `if (form == 'F1')`.
+      # A softwood carries form NA after split_formrisk, so that `if` raised "missing value
+      # where TRUE/FALSE needed" and the stand was discarded by the runner's per-stand
+      # tryCatch exactly as the calc_ddbh defect discarded it. Unlike ddbh_hw_mod, dht_hw_mod,
+      # ddbh_thin_mod and ddbh_sbw_mod, tsurv_hw_mod carries no NA-safe validity gate of its
+      # own. The guard below is a CALL-SITE wrapper only: tsurv_hw_mod's body is untouched and
+      # the wrapper short-circuits exactly the rows the surrounding ifelse gate discards
+      # anyway, returning a placeholder 1 that ifelse() then throws away. Every row the gate
+      # admits calls tsurv_hw_mod with byte-identical arguments, so no modifier's numerical
+      # behaviour changes.
       dplyr::mutate(tsurv.hw.mod = ifelse(!is.na(form) & gsub('[^0-9]', '', form) %in% 1:8 & sp %in% c('RO', 'YB', 'RM', 'PB', 'QA') & !is.na(b0),
-                                          purrr::pmap_dbl(list(dbh, bal, ba.plot, form, b0, b1), 
-                                                          tsurv_hw_mod),
+                                          purrr::pmap_dbl(list(dbh, bal, ba.plot, form, b0, b1),
+                                                          .tsurvhw_guard),
                                           1)) %>%
       dplyr::select(-b0, -b1)
   } else {
@@ -2890,11 +3008,52 @@ calc_mortality = function(tree.data, plot.data, region = stand$region,
         .rd_i = if (!is.null(plot.data$rd.mod)) dplyr::coalesce(plot.data$rd.mod, 0) else rep(0, nrow(plot.data))
         .ba_i = dplyr::coalesce(plot.data$ba.plot, 0)
         .qm_i = dplyr::coalesce(plot.data$qmd, 0)
-        .eta  = .Ping$b0 + .acd_hier_eta_dev(.Ping, rd = .rd_i, qmd = .qm_i, ba = .ba_i,
-                                             region = .grp$region, eco = .grp$eco, fortype = .grp$fortype)
-        .pred = exp(.eta)                                  # recruits per ha per year (log_years = 0)
-        .ok   = is.finite(.pred) & is.finite(.qm_i) & .qm_i > 0 & is.finite(.ba_i) & .ba_i > 0
-        plot.data$ingrowth.ph = ifelse(.ok, .pred, plot.data$ingrowth.ph)
+        # v13.1 FIX (ingrowth basis reconciliation, 2026-07-25): the fitted intercept exp(b0) sits on the
+        # FIA microplot recruit_tph-per-interval basis (exp(3.9269) ~ 51 recruits/ha/yr), about 4x the
+        # engine's native calibrated ingrowth.ph (~13). Applying exp(b0 + eta_dev) as an ABSOLUTE
+        # replacement therefore inflated recruitment ~4x at the training mean and up to ~14x on low-QMD
+        # high-BA stands (PEF 13.4 -> 186.4), while collapsing high-QMD stands (silc_l 13 -> 4.7), because
+        # the strong lnqmd effect (b_lnqmd = -2.37) rode on top of the wrong absolute basis. The predictor
+        # SCALING is correct: v131r_scaling.csv matches the ingrowth fit rows (gs recent==0: ba 22.98/12.69,
+        # ln_qmd 2.7014, rd 0.341) to three decimals, so no separate ingrowth-scaling file is needed. Fix:
+        # enter the posterior as a MULTIPLICATIVE density/composition modifier on the engine's native
+        # ingrowth.ph -- exp(eta_dev), i.e. the intercept and offset EXCLUDED so the modifier equals 1.0 at
+        # training-mean covariates -- exactly as the mortality posterior enters as a multiplicative hazard
+        # modifier (SWITCH B) rather than an absolute replacement. This preserves the engine's calibrated
+        # magnitude and adds only the fitted QMD-down / BA-up shape the flat ops$ingrowth.mult could not carry.
+        .eta_dev = .acd_hier_eta_dev(.Ping, rd = .rd_i, qmd = .qm_i, ba = .ba_i,
+                                     region = .grp$region, eco = .grp$eco, fortype = .grp$fortype)
+        # v13.1 NORMALIZATION FIX (2026-07-28). exp(eta_dev) is pointwise 1.0 at training-mean
+        # covariates but its MEAN over the fitting population is exp(sigma^2/2) ~ 1.97, so the
+        # unnormalized modifier inflated TOTAL recruitment about 97 pct on the very population the
+        # posterior was fitted to (PEF mean ING_p 25.78 against a base of 13.39, ratio 1.92 = 1.57
+        # legitimate covariate displacement x 1.42 pure convexity artefact). Divide by the shipped
+        # training-population normalizer .Ping$norm so the modifier is AGGREGATE-neutral (mean 1.0
+        # over the training covariate distribution) instead of POINTWISE-neutral at mean covariates.
+        # This keeps 100 pct of the fitted relative density and composition dependence, which is the
+        # scientific content of the posterior, and removes only the aggregate inflation. The engine's
+        # base ingrowth.ph is itself calibrated to a population mean, not to a mean-covariate stand,
+        # so aggregate neutrality is the correct invariant. .Ping$norm is read from the posterior
+        # CSVs and is independent of the stands being projected.
+        .nrm_i = tryCatch(if (!is.null(.Ping$norm) && length(.Ping$norm) == 1 &&
+                              is.finite(.Ping$norm) && .Ping$norm > 0) .Ping$norm else 1,
+                          error = function(e) 1)
+        .mod  = exp(.eta_dev) / .nrm_i                     # aggregate-neutral density/composition modifier
+        .ok   = is.finite(.mod) & is.finite(.qm_i) & .qm_i > 0 & is.finite(.ba_i) & .ba_i > 0
+        # v13.1 INGROWTH DENSITY SHUTOFF (2026-08-13). Neither the posterior modifier .mod nor the
+        # engine's native ingrowth.ph carries a density ceiling on the hier path, unlike the mortality
+        # posterior's sdm_keepc ceiling (~line 4195) which hard-clamps recruits toward 0 as relative
+        # density approaches ops$sdimort.max. Without an analogous ceiling here, high-RD stands with a
+        # favorable (low-QMD, high-BA) covariate profile can keep recruiting at full rate past the point
+        # a closed stand should self-limit, which is the mechanism behind the multi-minute-per-stand
+        # density-loop stalls seen in job 13451233. Hard multiplicative shutoff, gated
+        # ops$ingrowth.rd.ceiling (default 1.00, i.e. ceiling at RD = SDImax): ramps ingrowth.ph
+        # linearly to 0 as .rd_i approaches the ceiling and holds at 0 beyond it, mirroring sdm_keepc's
+        # clamp-to-[0,1] shape. Active ONLY inside this .hier_ing_on branch; the use.hier.ingrowth=FALSE
+        # flat-multiplier branch below is untouched and remains byte-identical to pre-fix behavior.
+        .ing_ceiling = tryCatch(if (!is.null(ops$ingrowth.rd.ceiling) && !is.na(ops$ingrowth.rd.ceiling)) ops$ingrowth.rd.ceiling else 1.00, error = function(e) 1.00)
+        .shutoff = pmax(0, pmin(1, (.ing_ceiling - .rd_i) / .ing_ceiling))
+        plot.data$ingrowth.ph = ifelse(.ok, plot.data$ingrowth.ph * .mod * .shutoff, plot.data$ingrowth.ph * .shutoff)
       } else {
         # Ingrowth calibration multiplier (product-mix calibration): scales predicted
         # recruits-per-ha. OFF (=1) unless ops$ingrowth.mult is set. Corrects the
@@ -2932,6 +3091,22 @@ calc_mortality = function(tree.data, plot.data, region = stand$region,
         .ir_c = tryCatch(if (!is.null(ops$ingrowth.rd.center) && !is.na(ops$ingrowth.rd.center)) ops$ingrowth.rd.center else 0.58, error=function(e) 0.58)
         .ir_k = tryCatch(if (!is.null(ops$ingrowth.rd.k) && !is.na(ops$ingrowth.rd.k)) ops$ingrowth.rd.k else 8, error=function(e) 8)
         .rel = 1 / (1 + exp(.ir_k * (dplyr::coalesce(plot.data$rd.mod, 0) - .ir_c)))
+        # v13.3 CANDIDATE (pass 33): size-structure (maturity) gate on density-released
+        # ingrowth. Gated ops$use.ingrowth.matgate (default FALSE => .rel unchanged, this
+        # block byte-identical to pass 31/32 behavior). When TRUE, .rel is further scaled by
+        # g(QMD) = 1/(1+exp(k*(qmd - qc))), qc default 12.7 cm (the FIA seedling-sapling to
+        # poletimber stand-size boundary, 5 in), k default 0.6. Rationale (pass 32 Bakuzis
+        # diagnosis, results/bakuzis/): after an sdimort-driven mid-rotation crash, the RD-only
+        # release refills the freed density headroom with volume-free recruits, so stem count
+        # rebuilds while volume does not and the stand stagnates below its pre-crash volume.
+        # Reserving the release pulse for juvenile size structures (QMD near or below qc)
+        # leaves a crashed mature stand's headroom to survivor BA/volume recovery instead.
+        .mg_on = tryCatch(if (!is.null(ops$use.ingrowth.matgate)) isTRUE(ops$use.ingrowth.matgate) else FALSE, error=function(e) FALSE)
+        if (.mg_on) {
+          .mg_qc = tryCatch(if (!is.null(ops$ingrowth.matgate.qc) && !is.na(ops$ingrowth.matgate.qc)) ops$ingrowth.matgate.qc else 12.7, error=function(e) 12.7)
+          .mg_k  = tryCatch(if (!is.null(ops$ingrowth.matgate.k)  && !is.na(ops$ingrowth.matgate.k))  ops$ingrowth.matgate.k  else 0.6,  error=function(e) 0.6)
+          .rel = .rel * (1 / (1 + exp(.mg_k * (dplyr::coalesce(plot.data$qmd, 0) - .mg_qc))))
+        }
         plot.data$ingrowth.ph = plot.data$ingrowth.ph * .rel
       }
 
@@ -3198,6 +3373,9 @@ make_ops = function(verbose = FALSE,
                     use.vol = FALSE,
                     use.hier.ingrowth = FALSE,   # v13.1 SWITCH A (default OFF => v12.11 flat ingrowth path)
                     use.hier.mortality = FALSE,  # v13.1 SWITCH B (default OFF => v12.11 mortality path)
+                    use.htgap.fix = FALSE,            # v13.1 Hook B (default OFF => sub-2.5cm height gate unchanged)
+                    use.dht.hw.mod.castle = FALSE,    # v13.1 Hook C (default OFF => v12.11 hardwood dht path)
+                    use.crhcb.recal = FALSE,          # v13.1 Hook D (default OFF => frozen dhcb coeffs)
                     hier.postdir = '~/v13_kickoff') {  # runtime posterior directory (point at ~/v13_subplot for subplot grain)
   
   # Convert strings to logical-- in case someone redefines TRUE and FALSE 
@@ -3242,10 +3420,14 @@ make_ops = function(verbose = FALSE,
                    use.vol=use.vol,
                    use.hier.ingrowth = char_to_logical(use.hier.ingrowth),
                    use.hier.mortality = char_to_logical(use.hier.mortality),
+                   use.htgap.fix = char_to_logical(use.htgap.fix),
+                   use.dht.hw.mod.castle = char_to_logical(use.dht.hw.mod.castle),
+                   use.crhcb.recal = char_to_logical(use.crhcb.recal),
                    hier.postdir = as.character(hier.postdir)) %>%
     dplyr::mutate(dplyr::across(c(verbose, use.cap.dbh, use.cap.ht, use.sbw.mod,
                                   use.thin.mod, use.hw.mod, use.mgmt.mod, use.ingrowth,
-                                  use.hier.ingrowth, use.hier.mortality),
+                                  use.hier.ingrowth, use.hier.mortality,
+                                  use.htgap.fix, use.dht.hw.mod.castle, use.crhcb.recal),
                                 as.logical),
                   dplyr::across(c(sbw.cdef, sbw.yr, sbw.dur, thin.ba.perc.rmv,
                                   thin.ba.pre, thin.qmd.ratio, thin.year,
@@ -3878,6 +4060,7 @@ AcadianGYOneStand = function(tree, stand, ops)
     calc_ht(plot.data = plot.smry) %>% 
     dplyr::mutate(#use predicted height if missing or > 50m and DBH> 2.5cm
            ht= dplyr::case_when((ht %in% c(NA, 0)| ht>50) & dbh>2.5 ~pht,
+                        isTRUE(ops$use.htgap.fix) & (ht %in% c(NA, 0)| ht>50) & dbh<=2.5 ~ pmin(pmax(pht, 1.37), 50),
                         TRUE ~ ht)) %>% 
            #predicted height to crown base (returns phcb)
     calc_hcb(plot.data = plot.smry) %>% 
